@@ -14,12 +14,12 @@ A Model Context Protocol (MCP) client that integrates seamlessly with Azure Open
 
 ![screenshot](assets/MCP_Client_for_Azure_Screenshot.png)
 
-Repository Link: https://github.com/hatasaki/MCP-Client-for-Azure
+Repository Link: https://github.com/hatasaki/MCP-Client-App-for-Azure
 
 ## Getting Started
 
 ### 0. Download the Binary
-1. Grab the latest release from GitHub: https://github.com/hatasaki/MCP-Client-for-Azure/releases
+1. Grab the latest release from GitHub: https://github.com/hatasaki/MCP-Client-App-for-Azure/releases
 2. Extract an executable file
 > **Windows users**
 > 1. After extracting, copy **`mcpclient.exe`** to any folder and double-click it to launch.
