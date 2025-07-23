@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-socketio[asyncio]
+pywebview[edgehtml]
+requests
+mcp
+openai
+azure-identity

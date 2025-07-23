@@ -1,0 +1,59 @@
+# -------------------------------------------------------
+# MCP Client for Azure – Electron (React) + Python monorepo
+# -------------------------------------------------------
+
+# ─── Node / React / Electron ───────────────────────────
+node_modules/
+client/node_modules/
+
+# Build / distribution output
+build/
+/dist/
+client/build/
+out/
+release-builds/
+
+
+# Electron builder / packager cache
+**/electron-builder-cache/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# ─── Python ────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+*.py[cod]
+*.pyd
+
+# Coverage reports
+coverage/
+*.coverage
+
+# ─── Logs ──────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Environment / secrets ─────────────────────────────
+data/
+AzureOpenAI.json
+mcp.json
+.env
+
+# ─── IDE / OS miscellanea ─────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ─── Archives ─────────────────────────────────────────
+*.tgz
+*.tar.gz
+*.zip
+# End of .gitignore

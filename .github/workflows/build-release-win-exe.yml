@@ -1,0 +1,64 @@
+name: Build and Release Windows EXE
+permissions:
+  contents: write
+  packages: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Get version
+        id: get_version
+        shell: pwsh
+        run: |
+          $content = Get-Content version_info.txt -Raw
+          if ($content -match "ProductVersion', '([\d\.]+)'") { $version = $Matches[1] }
+          "version=$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding UTF8 -Append
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Set up Node.js for client build
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Build React client
+        working-directory: client
+        run: npm run build
+
+      - name: Build EXE
+        run: |
+          pyinstaller --clean -F -n mcpclient --onefile --add-data "client\build;client\build" --icon "assets\\icon.ico" --noconsole --version-file version_info.txt app_runner.py
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\\mcpclient.exe","README.md" -DestinationPath mcpclient-windows-${{ steps.get_version.outputs.version }}.zip
+
+      - name: Create GitHub Release (official CLI)
+        shell: bash
+        run: |
+          gh release create v${{ steps.get_version.outputs.version }} \
+            mcpclient-windows-${{ steps.get_version.outputs.version }}.zip \
+            --title "Release ${{ steps.get_version.outputs.version }}" \
+            --notes "Automated Windows build with version ${{ steps.get_version.outputs.version }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

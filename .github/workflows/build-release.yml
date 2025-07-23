@@ -1,0 +1,134 @@
+name: Build and Release
+permissions:
+  contents: write
+  packages: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  version:
+    name: Extract version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Get version
+        id: get_version
+        shell: pwsh
+        run: |
+          $content = Get-Content version_info.txt -Raw
+          if ($content -match "ProductVersion', '([\d\.]+)'") { $version = $Matches[1] }
+          "version=$version" | Out-File -FilePath $Env:GITHUB_OUTPUT -Encoding UTF8 -Append
+
+  build:
+    name: build
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            osName: windows
+            ext: zip
+          - os: macos-latest
+            osName: macos
+            ext: tar.gz
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set version
+        run: echo "Using version ${{ needs.version.outputs.version }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Set up Node.js for client build
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Build React client
+        working-directory: client
+        run: npm run build
+
+      - name: Build executable (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pyinstaller --clean mcpclient_win.spec
+
+      - name: Build executable (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          pyinstaller --clean mcpclient_mac.spec
+
+      - name: Create Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\\mcpclient.exe","README.md" `
+            -DestinationPath mcpclient-${{ matrix.osName }}-${{ needs.version.outputs.version }}.${{ matrix.ext }}
+      - name: Upload Package (Windows)
+        if: matrix.osName == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcpclient-${{ matrix.osName }}-${{ needs.version.outputs.version }}
+          path: mcpclient-${{ matrix.osName }}-${{ needs.version.outputs.version }}.${{ matrix.ext }}
+
+      - name: Create Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          tar -czvf mcpclient-${{ matrix.osName }}-${{ needs.version.outputs.version }}.${{ matrix.ext }} README.md -C dist mcpclient.app
+      - name: Upload Package (macOS)
+        if: matrix.osName == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcpclient-${{ matrix.osName }}-${{ needs.version.outputs.version }}
+          path: mcpclient-${{ matrix.osName }}-${{ needs.version.outputs.version }}.${{ matrix.ext }}
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Download Windows Package
+        uses: actions/download-artifact@v4
+        with:
+          name: mcpclient-windows-${{ needs.version.outputs.version }}
+          path: .
+      - name: Download macOS Package
+        uses: actions/download-artifact@v4
+        with:
+          name: mcpclient-macos-${{ needs.version.outputs.version }}
+          path: .
+      - name: Create GitHub Release
+        shell: bash
+        run: |
+          gh release create v${{ needs.version.outputs.version }} \
+            mcpclient-windows-${{ needs.version.outputs.version }}.zip \
+            mcpclient-macos-${{ needs.version.outputs.version }}.tar.gz \
+            --title "Release ${{ needs.version.outputs.version }}" \
+            --notes "Build for version ${{ needs.version.outputs.version }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
