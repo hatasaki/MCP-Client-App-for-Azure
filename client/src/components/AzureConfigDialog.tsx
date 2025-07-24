@@ -72,14 +72,15 @@ const AzureConfigDialog: React.FC<AzureConfigDialogProps> = ({
       return;
     }
     setFormError('');
-    // Sanitize numeric fields: empty string->undefined
-    const sanitized = { ...config } as any;
-    ['temperature','topP','maxTokens','systemPrompt'].forEach((k) => {
-      if (sanitized[k] === '' || sanitized[k] === null || sanitized[k] === undefined) {
-        delete sanitized[k];
+    // Preserve blank values so backend can detect omission explicitly
+    const prepared = { ...config } as any;
+    ['temperature', 'topP', 'maxTokens'].forEach((k) => {
+      if (prepared[k] === undefined) {
+        // Convert undefined (from untouched optional fields) to empty string
+        prepared[k] = '';
       }
     });
-    onSave(sanitized);
+    onSave(prepared);
     onClose();
   };
 

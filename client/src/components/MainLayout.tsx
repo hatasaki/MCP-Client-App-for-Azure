@@ -402,9 +402,9 @@ const toSnake = (cfg: any) => ({
   deployment: cfg.deployment,
   api_version: cfg.apiVersion ?? cfg.api_version,
   system_prompt: cfg.systemPrompt ?? cfg.system_prompt,
-  temperature: cfg.temperature,
-  top_p: cfg.topP ?? cfg.top_p,
-  max_tokens: cfg.maxTokens ?? cfg.max_tokens,
+  temperature: cfg.temperature === undefined ? '' : cfg.temperature,
+  top_p: cfg.topP ?? cfg.top_p ?? '',
+  max_tokens: cfg.maxTokens ?? cfg.max_tokens ?? '',
 });
 const toCamel = (cfg: any) => ({
   endpoint: cfg.endpoint,
@@ -412,7 +412,7 @@ const toCamel = (cfg: any) => ({
   deployment: cfg.deployment,
   apiVersion: cfg.api_version ?? cfg.apiVersion,
   systemPrompt: cfg.system_prompt ?? cfg.systemPrompt,
-  temperature: cfg.temperature,
-  topP: cfg.top_p ?? cfg.topP,
-  maxTokens: cfg.max_tokens ?? cfg.maxTokens,
+  temperature: cfg.temperature === '' ? undefined : cfg.temperature,
+  topP: cfg.top_p === '' ? undefined : (cfg.top_p ?? cfg.topP),
+  maxTokens: cfg.max_tokens === '' ? undefined : (cfg.max_tokens ?? cfg.maxTokens),
 });

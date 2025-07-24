@@ -60,15 +60,19 @@ class AzureOpenAIService:
                 return {"stopped": True}
             params={"model":self.deployment,"messages":messages}
             # Optional generation parameters
-            temp=self.config.get("temperature")
-            if temp is not None:
-                params["temperature"]=temp
-            top_p=self.config.get("top_p")
-            if top_p is not None:
-                params["top_p"]=top_p
-            max_toks=self.config.get("max_tokens")
-            if max_toks:
-                params["max_tokens"]=max_toks
+            # Only include generation parameters when they are explicitly provided (non-blank)
+            temp = self.config.get("temperature")
+            if temp not in (None, ""):
+                params["temperature"] = temp
+
+            top_p = self.config.get("top_p")
+            if top_p not in (None, ""):
+                params["top_p"] = top_p
+
+            max_toks = self.config.get("max_tokens")
+            if max_toks not in (None, ""):
+                params["max_tokens"] = max_toks
+
             if tools:
                 params["functions"] = tools
                 # Force a particular tool call when requested, otherwise allow the model to pick automatically

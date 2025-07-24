@@ -104,13 +104,10 @@ def load_or_create_azure_conf() -> Dict[str, Any]:
         # ensure required keys exist
         data = json.loads(AZURE_CONF_PATH.read_text(encoding="utf-8"))
         changed = False
-        for k, v in {
-            "temperature": 1.0,
-            "top_p": 1.0,
-            "max_tokens": 8192,
-        }.items():
+        # Ensure keys exist even if blank so client round-trips preserve empties
+        for k in ("temperature", "top_p", "max_tokens"):
             if k not in data:
-                data[k] = v
+                data[k] = ""
                 changed = True
         if changed:
             AZURE_CONF_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -124,9 +121,9 @@ def load_or_create_azure_conf() -> Dict[str, Any]:
         # Prompt and generation parameters (added temperature, top_p, max_tokens)
         # Default generation parameters
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "max_tokens": 8192,
+        "temperature": "",
+        "top_p": "",
+        "max_tokens": "",
     }
     AZURE_CONF_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     return cfg

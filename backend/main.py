@@ -419,6 +419,7 @@ async def set_azure_config(cfg: dict):
     save_azure_conf(azure_conf)
     # recreate client
     azure_service = AzureOpenAIService(azure_conf)
+    await sio.emit('azureConfig', azure_conf)
     return azure_conf
 
 @sio.event
