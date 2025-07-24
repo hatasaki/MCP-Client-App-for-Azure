@@ -73,18 +73,41 @@ class AzureOpenAIService:
             if max_toks not in (None, ""):
                 params["max_tokens"] = max_toks
 
+            # ------------------------------------------------------------------
+            # Azure OpenAI 2025-02-01-preview onwards uses `tools` + `tool_choice`.
+            # Older parameters (`functions` / `function_call`) are now deprecated.
+            # ------------------------------------------------------------------
             if tools:
-                params["functions"] = tools
+                # Convert legacy function schema (without "type") into new tool schema
+                converted_tools = []
+                for t in tools:
+                    if t is None:
+                        continue
+                    if "type" in t:
+                        # Already in new format
+                        converted_tools.append(t)
+                    else:
+                        # Wrap legacy definition
+                        converted_tools.append({"type": "function", "function": t})
+
+                params["tools"] = converted_tools
                 # Force a particular tool call when requested, otherwise allow the model to pick automatically
                 if forced_tool_name:
-                    params["function_call"] = {"name": forced_tool_name}
+                    # Per new spec – force by setting tool_choice to a dict
+                    params["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": forced_tool_name},
+                    }
                 else:
-                    params["function_call"] = "auto"
+                    params["tool_choice"] = "auto"
             resp=await self.client.chat.completions.create(**params)
             msg=resp.choices[0].message
-            if msg.function_call:
-                name = msg.function_call.name
-                args = json.loads(msg.function_call.arguments or "{}")
+            # New format: tool_calls is a list when the model decides to call tools
+            if getattr(msg, "tool_calls", None):
+                # For simplicity handle one call at a time (single-turn)
+                call = msg.tool_calls[0]
+                name = call.function.name
+                args = json.loads(call.function.arguments or "{}")
                 # auto approve always in gui for now
                 if not auto_approve and approval_callback:
                     approved, always = await approval_callback({"name": name, "arguments": args})
@@ -102,7 +125,29 @@ class AzureOpenAIService:
                         rtxt = json.dumps(result, ensure_ascii=False, default=lambda o: getattr(o, '__dict__', str(o)))
                     except Exception:
                         rtxt = str(result)
-                messages.append({"role": "function", "name": name, "content": rtxt})
+                # First, append the assistant message that contained the tool_call request
+                messages.append({
+                    "role": "assistant",
+                    # content may be empty when the assistant only calls a tool
+                    "content": msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": call.id if hasattr(call, "id") else "",  # required to correlate
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": call.function.arguments or "{}",
+                            },
+                        }
+                    ],
+                })
+
+                # Then return the tool result
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id if hasattr(call, "id") else "",
+                    "content": rtxt,
+                })
                 executed.append(name)
                 continue
             return {"content":msg.content or "", "response_id":resp.id, "toolCalls": executed}
