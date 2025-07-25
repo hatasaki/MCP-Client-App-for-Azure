@@ -140,5 +140,8 @@ class AzureOpenAIService:
                     "content": rtxt,
                 })
                 executed.append(name)
+                # Reset forced_tool_name after the first execution
+                if forced_tool_name:
+                    forced_tool_name = None
                 continue
             return {"content":msg.content or "", "response_id":resp.id, "toolCalls": executed}
