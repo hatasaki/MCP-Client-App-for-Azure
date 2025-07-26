@@ -2,6 +2,10 @@
 
 A Model Context Protocol (MCP) client that integrates seamlessly with Azure OpenAI. It can connect to multiple MCP servers and includes a flexible tool-execution approval system.
 
+> ### Related blog articles:
+> - [Chat UI MCP Client App Integrates Azure OpenAI and MCP Servers](https://medium.com/@hatasaki/chat-ui-mcp-client-app-integrates-azure-openai-and-mcp-servers-works-on-windows-and-mac-08f6ed2672b7)
+> - (Japanese) [Azure OpenAI と MCP を連携するチャット UI アプリを作りました](https://qiita.com/hatasaki/items/84316fff8db67bf39e0a)
+
 ## Features
 
 - **Azure OpenAI Integration** – Works out-of-the-box with Azure OpenAI.
