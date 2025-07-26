@@ -37,7 +37,7 @@ app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)   # ← uvicorn が読�
 # -------------------------------------
 
 from app.config import load_or_create_azure_conf, load_mcp_servers, save_azure_conf, save_mcp_servers
-from app.mcp_manager import MCPManager
+from app.mcp_manager import MCPManager, register_callback_result
 from app.session_manager import SessionManager
 from app.saved_servers_manager import SavedServersManager
 from app.azure_openai_service import AzureOpenAIService
@@ -430,3 +430,11 @@ async def getMCPServerStatus(sid, serverKey):
         # Unknown server key – respond with unknown status
         msg = {"id": serverKey, "status": "unknown"}
     await sio.emit('mcpServerStatus', msg, room=sid)
+
+# OAuth callback endpoint for client
+@fastapi_app.get("/callback")
+async def oauth_callback(request: Request):
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    register_callback_result(code, state)
+    return HTMLResponse(content="Authentication complete. You can close this window.")

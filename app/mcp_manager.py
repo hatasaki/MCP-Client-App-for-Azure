@@ -6,7 +6,61 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.client.sse import sse_client
+from mcp.client.auth import OAuthClientProvider, TokenStorage
+from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from urllib.parse import urlparse
+from pydantic import AnyUrl
+import webbrowser
+from app_runner import HOST, PORT
 
+# Future for receiving OAuth callback via existing FastAPI server
+callback_future: asyncio.Future[tuple[str, str | None]] | None = None
+def register_callback_result(code: str | None, state: str | None) -> None:
+    """Called by backend /callback route to deliver OAuth code and state."""
+    global callback_future
+    if callback_future and not callback_future.done():
+        callback_future.set_result((code, state))
+
+class InMemoryTokenStorage(TokenStorage):
+    """Demo In-memory token storage implementation."""
+
+    def __init__(self):
+        self.tokens: OAuthToken | None = None
+        self.client_info: OAuthClientInformationFull | None = None
+
+    async def get_tokens(self) -> OAuthToken | None:
+        """Get stored tokens."""
+        return self.tokens
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        """Store tokens."""
+        self.tokens = tokens
+
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
+        """Get stored client information."""
+        return self.client_info
+
+    async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
+        """Store client information."""
+        self.client_info = client_info
+
+async def handle_redirect(auth_url: str) -> None:
+    try:
+        webbrowser.open(auth_url)
+        print(f"Opened browser to: {auth_url}")
+    except Exception as e:
+        print(f"Failed to open browser ({e}), please visit manually:")
+        print(f"Visit: {auth_url}")
+
+async def handle_callback() -> tuple[str, str | None]:
+    """Wait for OAuth callback delivered via backend /callback endpoint."""
+    global callback_future
+    loop = asyncio.get_event_loop()
+    callback_future = loop.create_future()
+    print("Waiting for OAuth callback at http://localhost:3001/callback ...")
+    # The backend must call register_callback_result when /callback is hit
+    code, state = await callback_future
+    return code or "", state
 
 class MCPManager:
     """Connects to configured MCP servers and exposes their tools."""
@@ -56,12 +110,31 @@ class MCPManager:
         tool_count = await self._register_session(session)
         print(f"✅ Connected to {name} (stdio) — {tool_count} tools")
 
+    async def _oauth_provider(self, url: str) -> OAuthClientProvider:
+        base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        client_url = f"http://{HOST}:{PORT}"
+        oauth_auth = OAuthClientProvider(
+            server_url=base_url,
+            client_metadata=OAuthClientMetadata(
+                client_name="MCP Client for Azure",
+                redirect_uris=[AnyUrl(f"{client_url}/callback")],
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+                client_uri=AnyUrl(client_url),
+            ),
+            storage=InMemoryTokenStorage(),
+            redirect_handler=handle_redirect,
+            callback_handler=handle_callback,
+        )
+        return oauth_auth
+
     async def _connect_streamable_http(self, name: str, cfg: Dict[str, Any]):
         url = cfg.get("url")
         if not url:
             raise ValueError("url not set")
+        oauth_auth = await self._oauth_provider(url)
         read, write, _ = await self._stack.enter_async_context(
-            streamablehttp_client(url, headers=cfg.get("headers") or None)
+            streamablehttp_client(url, headers=cfg.get("headers") or None, auth=oauth_auth)
         )
         session = await self._stack.enter_async_context(ClientSession(read, write))
         self.session_to_server_name[session] = name
@@ -72,8 +145,9 @@ class MCPManager:
         url = cfg.get("url")
         if not url:
             raise ValueError("url not set")
+        oauth_auth = await self._oauth_provider(url)
         read, write = await self._stack.enter_async_context(
-            sse_client(url, headers=cfg.get("headers") or None)
+            sse_client(url, headers=cfg.get("headers") or None, auth=oauth_auth)
         )
         session = await self._stack.enter_async_context(ClientSession(read, write))
         self.session_to_server_name[session] = name
