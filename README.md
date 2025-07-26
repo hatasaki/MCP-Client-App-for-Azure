@@ -67,6 +67,9 @@ URL : http://remote.mcp.io/mcp
 Header:
   "user-key": "secret"
 ```
+> **Support OAuth2 flow for authorization HTTP/SSE MCP server**
+> - In accordance with the [MCP authorization specification dated 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization).
+> - This app obtains a token to access a MCP server by opening browser for user consent and receiving a callback.
 
 ### 4. Start Chatting
 1. Click **New Session**.
