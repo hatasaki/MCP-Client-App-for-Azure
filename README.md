@@ -10,6 +10,7 @@ A Model Context Protocol (MCP) client that integrates seamlessly with Azure Open
 
 - **Azure OpenAI Integration** – Works out-of-the-box with Azure OpenAI.
 - **Multiple MCP Server Types** – Supports STDIO, SSE, and HTTP.
+- **Secure MCP Server Authorization** - Supports OAuth2 flow.
 - **Tool Approval Dialog** – Choose *Allow*, *Allow All*, or *Deny* for each tool call.
 - **Saved Server Management** – Persist and reuse MCP server settings.
 - **Session Management** – Store every chat as a local file for later reload.
@@ -67,7 +68,7 @@ URL : http://remote.mcp.io/mcp
 Header:
   "user-key": "secret"
 ```
-> **Support OAuth2 flow for authorization HTTP/SSE MCP server**
+> **Support OAuth2 flow for HTTP/SSE MCP server authorization**
 > - In accordance with the [MCP authorization specification dated 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization).
 > - This app obtains a token to access a MCP server by opening browser for user consent and receiving a callback.
 
