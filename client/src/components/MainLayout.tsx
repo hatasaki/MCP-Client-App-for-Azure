@@ -109,8 +109,10 @@ const MainLayout: React.FC = () => {
     });
 
     socket.on('sessionUpdated', (session: ChatSession) => {
-      setCurrentSession(session);
+      // Update sessions list always
       setSessions(prev => prev.map(s => s.id === session.id ? session : s));
+      // Only replace currentSession if it is the one being updated
+      setCurrentSession(prev => (prev && prev.id === session.id ? session : prev));
     });
 
     socket.on('mcpServers', (servers: MCPServerConfig[]) => {
