@@ -107,6 +107,8 @@ class AzureOpenAIService:
                     if not approved:
                         messages.append({"role": "assistant", "content": "[Tool execution skipped]"})
                         continue
+                # Print the tool call input for debugging/trace purposes
+                print(f"➡️  Executing tool '{name}' with arguments: {args}")
                 result = await tool_executor(session_id, name, args)
                 # serialize tool result safely
                 if isinstance(result, (str, int, float, bool)):
@@ -116,6 +118,8 @@ class AzureOpenAIService:
                         rtxt = json.dumps(result, ensure_ascii=False, default=lambda o: getattr(o, '__dict__', str(o)))
                     except Exception:
                         rtxt = str(result)
+                # Print the tool call output for debugging/trace purposes
+                print(f"⬅️  Result from tool '{name}': {rtxt}")
                 # First, append the assistant message that contained the tool_call request
                 messages.append({
                     "role": "assistant",

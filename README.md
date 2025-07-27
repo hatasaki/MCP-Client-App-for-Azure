@@ -84,19 +84,14 @@ Header:
 6. All messages and tool results are stored in `data/sessions/<id>.json` and can be reopened from **Session List** after restarting the app.
 7. Force a tool call – Prefix your message with `#<toolName>` to make sure the assistant calls that tool. For example, writing `#weather What's the weather today?` will always invoke the `weather` tool. The tool name must match one selected in **Select Tool**. The prefix is stripped before sending so the MCP server receives only the original question.
 
-## Troubleshooting
+## Optional Settings
+You can use optional settings by adding following configuration to mcpclient.conf (`%USERPROFILE%\.mcpclient\mcpclient.conf` on Windows, **`$HOME/.mcpclient/mcpclient.conf`** on Linux).
 
-### Connection Errors
+ - logging: output log to specified file
+   - `"log_file": "<path to your file>"`
+ - server port: specify port (default is 3001)
+   - `"port": <port number>`
 
-1. **Azure OpenAI**
-   - Check the endpoint URL.
-   - Verify the API key.
-   - Confirm the deployment name.
-
-2. **MCP Server**
-   - **STDIO:** Is the command path correct?
-   - **HTTP:** Is the server running?
-   - **SSE:** Is the URL correct?
 
 ## Disclaimer
 This sample application is for testing, evaluation, and demos only. Use it at your own risk. It is not affiliated with or endorsed by the developer’s organization.

@@ -7,6 +7,7 @@ import os
 import threading
 import sys
 from pathlib import Path
+import json
 
 import time
 import requests
@@ -34,13 +35,52 @@ class _Null(io.TextIOBase):
         return False
 
 # --------------------------------------------------
+# Helper: load user-defined port from config file
+# --------------------------------------------------
+def _load_config_port() -> int | None:
+    """Return port number from user config, if available and valid."""
+    try:
+        if CONFIG_PATH.is_file():
+            with CONFIG_PATH.open(encoding="utf-8") as fp:
+                data = json.load(fp)
+            port = data.get("port")
+            if isinstance(port, int) and 0 < port < 65536:
+                return port
+            # Allow string that looks like an int as well, e.g. env-based templating
+            if isinstance(port, str) and port.isdigit():
+                num = int(port)
+                if 0 < num < 65536:
+                    return num
+    except Exception:  # Broad except: ignore malformed config
+        pass
+    return None
+
+# --------------------------------------------------
 # Configuration
 # --------------------------------------------------
-HOST = "127.0.0.1"
-PORT = 3001
+
 BACKEND_APP_IMPORT = "backend.main:app"  # ASGI application path
 WINDOW_TITLE = "MCP Client for Azure"
 LOADING_PAGE = Path(__file__).with_name("assets").joinpath("loading.html")
+# Path to user configuration file (used by both port and logging helpers)
+CONFIG_PATH = Path.home() / ".mcpclient" / "mcpclient.conf"
+
+HOST = "127.0.0.1"
+_DEFAULT_PORT = 3001
+PORT: int = _load_config_port() or _DEFAULT_PORT
+
+def _load_config_logfile() -> str | None:
+    """Return logfile path from user config, if available and valid."""
+    try:
+        if CONFIG_PATH.is_file():
+            with CONFIG_PATH.open(encoding="utf-8") as fp:
+                data = json.load(fp)
+            logfile = data.get("log_file")
+            if isinstance(logfile, str) and logfile.strip():
+                return logfile
+    except Exception:  # Broad except: ignore malformed config
+        pass
+    return None
 
 
 def run_backend() -> None:
@@ -78,7 +118,13 @@ def _setup_logging(log_path: str | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Launch MCP Client for Azure")
-    parser.add_argument("--log", metavar="FILE", help="write stdout/stderr to file when windowed")
+    default_log = _load_config_logfile()
+    parser.add_argument(
+        "--log",
+        metavar="FILE",
+        default=default_log,
+        help="write stdout/stderr to file when windowed (overrides config)",
+    )
     args, _ = parser.parse_known_args()
 
     _setup_logging(args.log)

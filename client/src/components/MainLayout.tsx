@@ -22,10 +22,8 @@ import AzureConfigDialog from './AzureConfigDialog';
 
 const DRAWER_WIDTH = 300;
 
-const backendUrl =
-  (import.meta as any).env?.VITE_BACKEND_URL ||
-  (process as any).env?.REACT_APP_SERVER_URL ||
-  'http://localhost:3001';
+// Backend URL: assume frontend is served from same origin as backend (PyWebView)
+const backendUrl = window.location.origin;
 
 const MainLayout: React.FC = () => {
   const { socket, isConnected } = useSocket();

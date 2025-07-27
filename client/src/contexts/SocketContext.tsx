@@ -25,10 +25,7 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   useEffect(() => {
     // derive backend URL: Vite (VITE_BACKEND_URL) or CRA (REACT_APP_BACKEND_URL)
-    const backendUrl =
-      (import.meta as any).env?.VITE_BACKEND_URL ||
-      (process as any).env?.REACT_APP_BACKEND_URL ||
-      'http://localhost:3001';
+    const backendUrl = window.location.origin
 
     // Connect explicitly to backend port to avoid same-origin issue
     const newSocket = io(backendUrl, {
