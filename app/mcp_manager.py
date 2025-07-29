@@ -57,7 +57,7 @@ async def handle_callback() -> tuple[str, str | None]:
     global callback_future
     loop = asyncio.get_event_loop()
     callback_future = loop.create_future()
-    print("Waiting for OAuth callback at http://localhost:3001/callback ...")
+    print(f"Waiting for OAuth callback at http://{HOST}:{PORT}/callback ...")
     # The backend must call register_callback_result when /callback is hit
     code, state = await callback_future
     return code or "", state

@@ -89,7 +89,7 @@ You can use optional settings by adding following configuration to mcpclient.con
 
  - logging: output log to specified file
    - `"log_file": "<path to your file>"`
- - server port: specify port (default is 3001)
+ - internal server port: specify port number(default is 3001)
    - `"port": <port number>`
 
 
