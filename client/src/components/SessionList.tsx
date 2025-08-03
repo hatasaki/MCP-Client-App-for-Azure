@@ -33,7 +33,7 @@ const SessionList: React.FC<SessionListProps> = ({
     const isToday = now.toDateString() === sessionDate.toDateString();
     
     if (isToday) {
-      return sessionDate.toLocaleTimeString('ja-JP', {
+      return sessionDate.toLocaleTimeString('en-US', {
         hour: '2-digit',
         minute: '2-digit',
       });
@@ -41,13 +41,13 @@ const SessionList: React.FC<SessionListProps> = ({
     
     const isThisYear = now.getFullYear() === sessionDate.getFullYear();
     if (isThisYear) {
-      return sessionDate.toLocaleDateString('ja-JP', {
+      return sessionDate.toLocaleDateString('en-US', {
         month: 'short',
         day: 'numeric',
       });
     }
     
-    return sessionDate.toLocaleDateString('ja-JP', {
+    return sessionDate.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
