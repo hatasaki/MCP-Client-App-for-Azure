@@ -39,7 +39,7 @@ export interface ChatSession {
   createdAt: Date;
   updatedAt: Date;
   autoApproveAll?: boolean;
-  responseId?: string; // Azure OpenAI Response API用のID
+  responseId?: string; // Azure OpenAI Responses API用のID
 }
 
 export interface AzureOpenAIConfig {
@@ -60,6 +60,14 @@ export type AzureConfig = AzureOpenAIConfig & {
   systemPrompt?: string;
   topP?: number;
   maxTokens?: number;
+  apiType?: 'chat' | 'responses';
+  // New Responses API (GPT-5) parameters (UI friendly names)
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high';
+  verbosity?: 'none' | 'low' | 'medium' | 'high';
+  maxCompletionTokens?: number;
+  // Backend compatibility keys (when reading from server)
+  reasoning_effort?: string;
+  max_completion_tokens?: number | string;
 };
 
 export interface SelectedTool {

@@ -9,24 +9,31 @@ from .config import DEFAULT_SYSTEM_PROMPT
 
 class AzureOpenAIService:
     def __init__(self, config: Dict[str, Any]):
-        # configure OpenAI SDK for Azure
+        # helper to read either camelCase or snake_case key
+        def cfg_get(*keys: str, default: Any = None):
+            for k in keys:
+                if k in config:
+                    return config.get(k)
+            return default
+
         self.config=config
-        key=config.get("api_key")
-        deployment=config.get("deployment")
+        key=cfg_get("api_key","apiKey")
+        deployment=cfg_get("deployment")
+        api_version = cfg_get("api_version", "apiVersion")
         if key:
             self.client=AsyncAzureOpenAI(
-                azure_endpoint=config.get("endpoint"),
+                azure_endpoint=cfg_get("endpoint"),
                 api_key=key,
-                api_version=config.get("api_version"),
+                api_version=api_version,
                 azure_deployment=deployment,
             )
         else:
             token_provider = get_bearer_token_provider(DefaultAzureCredential(exclude_interactive_browser_credential=False), "https://cognitiveservices.azure.com/.default")
 
             self.client=AsyncAzureOpenAI(
-                azure_endpoint=config.get("endpoint"),
+                azure_endpoint=cfg_get("endpoint"),
                 azure_ad_token_provider=token_provider,
-                api_version=config.get("api_version"),
+                api_version=api_version,
                 azure_deployment=deployment,
             )
         self.deployment=deployment

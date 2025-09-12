@@ -105,9 +105,13 @@ def load_or_create_azure_conf() -> Dict[str, Any]:
         data = json.loads(AZURE_CONF_PATH.read_text(encoding="utf-8"))
         changed = False
         # Ensure keys exist even if blank so client round-trips preserve empties
-        for k in ("temperature", "top_p", "max_tokens"):
+        for k in ("temperature", "top_p", "max_tokens", "api_type", "reasoning_effort", "verbosity", "max_completion_tokens"):
             if k not in data:
-                data[k] = ""
+                # default for api_type is "chat"
+                if k == "api_type":
+                    data[k] = "chat"
+                else:
+                    data[k] = ""
                 changed = True
         if changed:
             AZURE_CONF_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -124,6 +128,11 @@ def load_or_create_azure_conf() -> Dict[str, Any]:
         "temperature": "",
         "top_p": "",
         "max_tokens": "",
+        "api_type": "chat",  # new field: 'chat' or 'response'
+        # New Responses API (reasoning) parameters
+        "reasoning_effort": "",   # 'minimal' | 'low' | 'medium' | 'high' (omit if blank/none)
+        "verbosity": "",          # 'low' | 'medium' | 'high' (omit if blank/none)
+        "max_completion_tokens": "",  # integer (omit if blank)
     }
     AZURE_CONF_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     return cfg

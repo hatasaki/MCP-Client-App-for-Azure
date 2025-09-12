@@ -199,7 +199,7 @@ const MainLayout: React.FC = () => {
       setServerAzureConfigured(true);
       // Also save to client storage
       setAzureConfig(savedConfig);
-      localStorage.setItem('azureConfig', JSON.stringify(savedConfig));
+      localStorage.setItem('azureConfig', JSON.stringify({ ...savedConfig }));
       setShowAzureConfig(false);
     } catch (err) {
       console.error('[MainLayout] Failed to save Azure config to server - details not logged for security');
@@ -405,6 +405,23 @@ const toSnake = (cfg: any) => ({
   temperature: cfg.temperature === undefined ? '' : cfg.temperature,
   top_p: cfg.topP ?? cfg.top_p ?? '',
   max_tokens: cfg.maxTokens ?? cfg.max_tokens ?? '',
+  api_type: (cfg.apiType ?? cfg.api_type) as 'chat' | 'responses',
+  // New Responses API parameters
+  reasoning_effort: (() => {
+    const v = cfg.reasoningEffort ?? cfg.reasoning_effort;
+    if (v === undefined || v === null) return '';
+    return v === 'none' ? '' : v; // omit when 'none'
+  })(),
+  verbosity: (() => {
+    const v = cfg.verbosity;
+    if (v === undefined || v === null) return '';
+    return v === 'none' ? '' : v; // omit when 'none'
+  })(),
+  max_completion_tokens: (() => {
+    const v = cfg.maxCompletionTokens ?? cfg.max_completion_tokens;
+    if (v === undefined || v === null || v === '') return '';
+    return Number(v);
+  })(),
 });
 const toCamel = (cfg: any) => ({
   endpoint: cfg.endpoint,
@@ -415,4 +432,19 @@ const toCamel = (cfg: any) => ({
   temperature: cfg.temperature === '' ? undefined : cfg.temperature,
   topP: cfg.top_p === '' ? undefined : (cfg.top_p ?? cfg.topP),
   maxTokens: cfg.max_tokens === '' ? undefined : (cfg.max_tokens ?? cfg.maxTokens),
+  apiType: cfg.api_type ?? cfg.apiType,
+  // New Responses API parameters
+  reasoningEffort: (() => {
+    const v = cfg.reasoning_effort ?? cfg.reasoningEffort;
+    return !v ? 'none' : v; // empty string -> 'none' for UI
+  })(),
+  verbosity: (() => {
+    const v = cfg.verbosity;
+    return !v ? 'none' : v;
+  })(),
+  maxCompletionTokens: (() => {
+    const v = cfg.max_completion_tokens ?? cfg.maxCompletionTokens;
+    if (v === '' || v === undefined || v === null) return undefined;
+    return Number(v);
+  })(),
 });

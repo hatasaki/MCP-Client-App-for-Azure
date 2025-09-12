@@ -9,6 +9,7 @@ import asyncio
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
+from app.responses_api import AzureOpenAIResponseService  # new import
 
 # ---------- ASGI アプリ構成 ----------
 fastapi_app = FastAPI()
@@ -68,7 +69,10 @@ async def startup_event():
     # constructor will internally decide whether to use an API key or Entra ID
     # (AAD) authentication depending on whether ``api_key`` is present.
     if azure_conf.get("endpoint"):
-        azure_service = AzureOpenAIService(azure_conf)
+        api_type_cfg = azure_conf.get("api_type", "chat")
+        print("API type:", api_type_cfg)
+        svc_cls = AzureOpenAIResponseService if api_type_cfg in ("response", "responses") else AzureOpenAIService
+        azure_service = svc_cls(azure_conf)
     else:
         azure_service = None
         print("[Startup] Azure OpenAI client not created (missing endpoint)")
@@ -252,10 +256,33 @@ async def sendMessage(sid, data):
     else:
         tools = []
 
-    # ensure azure_service is initialized
-    if azure_service is None:
-        await sio.emit('error', {'message':'Azure configuration is incomplete'}, room=sid)
-        return
+    # ensure azure_service is initialized and matches requested api type
+    desired_api = (azure_cfg_used.get("api_type") or azure_cfg_used.get("apiType") or "chat").lower()
+    print("API config:", azure_cfg_used.get("api_type") , azure_cfg_used.get("apiType"), "API type:", desired_api)
+
+    global azure_service
+    def _svc_is_response(svc):
+        from app.responses_api import AzureOpenAIResponseService as _R
+        return isinstance(svc, _R)
+    def _svc_is_chat(svc):
+        from app.azure_openai_service import AzureOpenAIService as _C
+        return isinstance(svc, _C)
+    def _cfg_changed(svc, cfg: dict) -> bool:
+        try:
+            curr = getattr(svc, 'config', {}) or {}
+            # Compare JSON-serialized configs (order-insensitive)
+            return json.dumps(curr, sort_keys=True, default=str) != json.dumps(cfg or {}, sort_keys=True, default=str)
+        except Exception:
+            return True
+
+    if (
+        azure_service is None or
+        (_svc_is_response(azure_service) and desired_api=="chat") or
+        (_svc_is_chat(azure_service) and desired_api in ("response", "responses")) or
+        _cfg_changed(azure_service, azure_cfg_used)
+    ):
+        svc_cls = AzureOpenAIResponseService if desired_api in ("response", "responses") else AzureOpenAIService
+        azure_service = svc_cls(azure_cfg_used)
 
     async def approval_cb(req):
         fid=req['id']=str(uuid.uuid4())
@@ -415,10 +442,12 @@ async def set_azure_config(cfg: dict):
     # basic validation
     if not cfg.get("endpoint") or not cfg.get("deployment"):
         raise HTTPException(status_code=400, detail="endpoint and deployment are required")
+    # Accept and persist new Responses API params as-is (empty string means omit)
     azure_conf.update(cfg)
     save_azure_conf(azure_conf)
     # recreate client
-    azure_service = AzureOpenAIService(azure_conf)
+    svc_cls = AzureOpenAIResponseService if azure_conf.get("api_type") in ("response", "responses") else AzureOpenAIService
+    azure_service = svc_cls(azure_conf)
     await sio.emit('azureConfig', azure_conf)
     return azure_conf
 
