@@ -108,8 +108,7 @@ const AzureConfigDialog: React.FC<AzureConfigDialogProps> = ({
       }
       // verbosity: omit when 'none'
       if (prepared.verbosity && prepared.verbosity !== 'none') {
-        // use same key name in backend config
-        prepared.verbosity = prepared.verbosity;
+        // keep as is
       } else {
         prepared.verbosity = '';
       }
