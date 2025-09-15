@@ -76,23 +76,31 @@ class AzureOpenAIResponseService:
         ``ValueError`` will be raised so that the caller can fall back to
         ChatCompletion.
         """
-        # Combine history into a single prompt: ChatCompletion style histories are
-        # flattened into a simple text conversation for the legacy endpoint.
-        # Format:   <role>: <message>\n\n  ...
-        # Assistant will respond after the conversation context.
-        conv_lines: list[str] = []
+        # Build structured conversation for Responses API: each entry must include
+        # "role", "type", and "content" fields.  We default the *type* to "text".
+        conv_msgs: list[dict[str, Any]] = []
         for m in messages:
             role = m.get("role", "user")
             content = m.get("content", "")
-            conv_lines.append(f"{role}: {content}")
-        prompt = "\n\n".join(conv_lines)
+            conv_msgs.append({
+                "role": role,
+                "type": "message",
+                "content": content,
+            })
+
+        prompt: list[dict[str, Any]] = conv_msgs
 
         # Ensure a system prompt exists
         if not messages or messages[0].get("role") != "system":
             date_str = datetime.now().strftime("%B %d, %Y")
             base_prompt = self.config.get("system_prompt", DEFAULT_SYSTEM_PROMPT).rstrip()
             system_prompt = f"{base_prompt}\nCurrent date: {date_str}"
-            prompt = f"system: {system_prompt}\n\n" + prompt
+            # Prepend a structured system message
+            prompt.insert(0, {
+                "role": "system",
+                "type": "message",
+                "content": system_prompt,
+            })
 
         # Helper to prefer explicitly provided keys, supporting camelCase / snake_case
         def cfg_get(*keys: str, default: Any = None):
@@ -164,10 +172,11 @@ class AzureOpenAIResponseService:
                 p["reasoning"] = {"effort": reasoning_effort}
             if verbosity and verbosity != "none":
                 p.setdefault("text", {})["verbosity"] = verbosity
-            # Advertise tools only on the very first request to avoid infinite recursion
-            if converted_tools and not prev_resp_id:
+            # Always include available tools so the model can call them in follow-up turns
+            if converted_tools:
                 p["tools"] = converted_tools
-                p["tool_choice"] = {"type": "function", "name": forced_tool} if forced_tool else "auto"
+                if forced_tool:
+                    p["tool_choice"] = {"type": "function", "name": forced_tool}
             return p
 
         executed: list[str] = []
