@@ -11,8 +11,8 @@ permissions:
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
   TAGS: |
-    ghcr.io/${{ github.repository }}:latest
-    ghcr.io/${{ github.repository }}:${{ github.sha }}
+    ghcr.io/${{ toLower(github.repository) }}:latest
+    ghcr.io/${{ toLower(github.repository) }}:${{ github.sha }}
 
 jobs:
   build-and-push:
