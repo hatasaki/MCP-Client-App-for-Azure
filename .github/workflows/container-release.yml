@@ -47,4 +47,5 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Show summary
-        run: echo "Images pushed: $TAGS" >> $GITHUB_STEP_SUMMARY
+        run: |
+          echo "Images pushed: $TAGS" >> $GITHUB_STEP_SUMMARY
