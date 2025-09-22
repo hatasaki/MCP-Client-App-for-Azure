@@ -41,8 +41,8 @@ COPY --from=client-build /app/client/build ./client/build
 RUN mkdir -p "$HOME/mcpclientdata" "$HOME/.mcpclient" \
     && echo "{\"data_dir\": \"$HOME/mcpclientdata\"}" > "$HOME/.mcpclient/mcpclient.conf"
 
-# Expose the application port
+# Expose backend HTTP port
 EXPOSE 3001
 
-# Run application launcher
-CMD ["python", "./app_runner.py"]
+# Launch FastAPI + Socket.IO server directly (no GUI)
+CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "3001"]
