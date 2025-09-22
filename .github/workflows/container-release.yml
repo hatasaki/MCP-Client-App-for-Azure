@@ -9,10 +9,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
-  TAGS: |
-    ghcr.io/${{ toLower(github.repository) }}:latest
-    ghcr.io/${{ toLower(github.repository) }}:${{ github.sha }}
+  REGISTRY: ghcr.io
 
 jobs:
   build-and-push:
@@ -36,12 +33,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set lowercase repository name
+        id: repo
+        run: echo "REPO=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
       - name: "Build & Push image (latest + sha)"
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ env.TAGS }}
+          tags: ${{ env.REGISTRY }}/${{ env.REPO }}:latest,${{ env.REGISTRY }}/${{ env.REPO }}:${{ github.sha }}
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
