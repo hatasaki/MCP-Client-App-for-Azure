@@ -31,19 +31,19 @@ jobs:
       - name: Set lowercase repository name
         id: repo
         run: |
-          REPO=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
-          echo "REPO=$REPO" >> $GITHUB_ENV
-          echo "IMAGE=${{ env.REGISTRY }}/$REPO:latest" >> $GITHUB_ENV
+          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
 
       - name: "Build & Push image (latest)"
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE }}
+          tags: "ghcr.io/${{ steps.repo.outputs.repo }}:latest"
           platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Show summary
-        run: echo "Image pushed: $IMAGE" >> $GITHUB_STEP_SUMMARY
+        run: |
+          echo "Image pushed: ghcr.io/${{ steps.repo.outputs.repo }}:latest" >> $GITHUB_STEP_SUMMARY
