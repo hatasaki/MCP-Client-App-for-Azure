@@ -37,8 +37,12 @@ COPY assets ./assets
 # Copy the built React client from the previous stage
 COPY --from=client-build /app/client/build ./client/build
 
-# Expose the application port
-EXPOSE 5000
+# Create user home data directory and default config
+RUN mkdir -p "$HOME/mcpclientdata" "$HOME/.mcpclient" \
+    && echo "{\"data_dir\": \"$HOME/mcpclientdata\"}" > "$HOME/.mcpclient/mcpclient.conf"
+
+# Expose the application port (matches uvicorn)
+EXPOSE 3001
 
 # Start the FastAPI + Socket.IO server using uvicorn
-CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "5000"]
+CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0"]
