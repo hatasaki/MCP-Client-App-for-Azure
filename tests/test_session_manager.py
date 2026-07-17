@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from agent_framework import AgentSession
+
+from app.session_manager import SessionManager
+
+
+def test_legacy_session_migrates_without_response_id(tmp_path: Path):
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps({
+        "id": "legacy",
+        "name": "Chat old",
+        "messages": [
+            {"role": "user", "content": "hello", "timestamp": "2025-01-01T00:00:00Z"},
+            {"role": "assistant", "content": "hi", "timestamp": "2025-01-01T00:00:01Z"},
+        ],
+        "createdAt": "2025-01-01T00:00:00Z",
+        "updatedAt": "2025-01-01T00:00:01Z",
+        "responseId": "resp_old",
+    }), encoding="utf-8")
+
+    manager = SessionManager(tmp_path)
+    session = manager.get_session("legacy")
+
+    assert session is not None
+    assert session["schemaVersion"] == 2
+    assert "responseId" not in session
+    assert all(message["status"] == "completed" for message in session["messages"])
+    assert all(message["id"] for message in session["messages"])
+
+
+def test_matching_fingerprint_restores_full_agent_session(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    manager.create("chat")
+    original = AgentSession(session_id="chat", service_session_id="resp_123")
+    original.state["custom"] = {"value": 42}
+    manager.save_agent_session("chat", original, "same")
+
+    restored, replay, reset = manager.prepare_agent_session("chat", "same")
+
+    assert restored.service_session_id == "resp_123"
+    assert restored.state == {"custom": {"value": 42}}
+    assert replay == []
+    assert reset is False
+
+
+def test_first_run_of_empty_session_is_not_reported_as_state_reset(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    manager.create("chat")
+
+    fresh, replay, reset = manager.prepare_agent_session("chat", "first")
+
+    assert fresh.service_session_id is None
+    assert replay == []
+    assert reset is False
+    assert manager.get_session("chat")["stateEpoch"] == 0
+
+
+def test_changed_fingerprint_replays_only_completed_text(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    manager.create("chat")
+    manager.append_message("chat", role="user", content="first")
+    manager.append_message("chat", role="assistant", content="answer")
+    manager.append_message("chat", role="assistant", content="partial", status="cancelled")
+    original = AgentSession(session_id="chat", service_session_id="resp_old")
+    manager.save_agent_session("chat", original, "old")
+
+    fresh, replay, reset = manager.prepare_agent_session("chat", "new")
+
+    assert fresh.service_session_id is None
+    assert [message.role for message in replay] == ["user", "assistant"]
+    assert [message.text for message in replay] == ["first", "answer"]
+    assert reset is True
+    assert manager.get_session("chat")["stateEpoch"] == 1
+    assert manager.get_session("chat")["mafState"] is None
+
+    # A process restart before the new run is saved must not revive old MAF state.
+    reloaded = SessionManager(tmp_path)
+    restarted, restarted_replay, restarted_reset = reloaded.prepare_agent_session("chat", "new")
+    assert restarted.service_session_id is None
+    assert [message.text for message in restarted_replay] == ["first", "answer"]
+    assert restarted_reset is True
+
+
+def test_cancel_rollback_restores_pre_run_state(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    manager.create("chat")
+    original = AgentSession(session_id="chat", service_session_id="resp_before")
+    manager.save_agent_session("chat", original, "fp")
+    running, _, _ = manager.prepare_agent_session("chat", "fp")
+    running.service_session_id = "resp_after"
+    manager.save_agent_session("chat", running, "fp")
+
+    # Simulate a new run whose state is snapshotted and then cancelled.
+    manager.prepare_agent_session("chat", "fp")
+    manager.rollback_agent_session("chat")
+
+    restored = AgentSession.from_dict(manager.get_session("chat")["mafState"])
+    assert restored.service_session_id == "resp_after"
+
+
+def test_replay_tail_is_deterministic(tmp_path: Path):
+    manager = SessionManager(tmp_path, max_replay_characters=5)
+    manager.create("chat")
+    manager.append_message("chat", role="user", content="1111")
+    manager.append_message("chat", role="assistant", content="2222")
+    manager.append_message("chat", role="user", content="3333")
+
+    replay = manager.build_replay_messages(manager.get_session("chat"))
+
+    assert [message.text for message in replay] == ["3333"]
+
+
+def test_public_session_never_exposes_maf_state_or_fingerprint(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    manager.create("chat")
+    agent_session = AgentSession(session_id="chat")
+    agent_session.state["secret-shaped-provider-state"] = "opaque"
+    manager.save_agent_session("chat", agent_session, "fingerprint")
+
+    public = manager.get("chat")
+
+    assert "mafState" not in public
+    assert "preRunMafState" not in public
+    assert "configFingerprint" not in public

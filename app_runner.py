@@ -8,11 +8,10 @@ import threading
 import sys
 from pathlib import Path
 import json
+import tempfile
+import traceback
 
 import time
-import requests
-import uvicorn
-import webview
 
 # Redirect stdout/stderr to a custom null device with write/flush methods
 import io
@@ -60,7 +59,7 @@ def _load_config_port() -> int | None:
 # --------------------------------------------------
 
 BACKEND_APP_IMPORT = "backend.main:app"  # ASGI application path
-WINDOW_TITLE = "MCP Client for Azure"
+WINDOW_TITLE = "MCP Client for Microsoft Foundry"
 LOADING_PAGE = Path(__file__).with_name("assets").joinpath("loading.html")
 # Path to user configuration file (used by both port and logging helpers)
 CONFIG_PATH = Path.home() / ".mcpclient" / "mcpclient.conf"
@@ -68,6 +67,7 @@ CONFIG_PATH = Path.home() / ".mcpclient" / "mcpclient.conf"
 HOST = "127.0.0.1"
 _DEFAULT_PORT = 3001
 PORT: int = _load_config_port() or _DEFAULT_PORT
+os.environ.setdefault("MCPCLIENT_CALLBACK_BASE_URL", f"http://{HOST}:{PORT}")
 
 def _load_config_logfile() -> str | None:
     """Return logfile path from user config, if available and valid."""
@@ -85,12 +85,16 @@ def _load_config_logfile() -> str | None:
 
 def run_backend() -> None:
     """Run the Uvicorn ASGI server (blocking)."""
+    import uvicorn
+
     # "reload" is disabled for packaged executables
     uvicorn.run(BACKEND_APP_IMPORT, host=HOST, port=PORT, reload=False, log_level="info")
 
 
-def wait_for_backend(window: webview.Window) -> None:
+def wait_for_backend(window: object) -> None:
     """Poll the backend until it is reachable, then load it in the WebView."""
+    import requests
+
     url = f"http://{HOST}:{PORT}"
     while True:
         try:
@@ -98,7 +102,7 @@ def wait_for_backend(window: webview.Window) -> None:
             break
         except requests.RequestException:
             time.sleep(0.5)
-    window.load_url(url)
+    window.load_url(url)  # type: ignore[attr-defined]
 
 
 def _setup_logging(log_path: str | None) -> None:
@@ -110,14 +114,14 @@ def _setup_logging(log_path: str | None) -> None:
         sys.stdout = fp
         sys.stderr = fp
     else:
-        # In windowed mode suppress console output unless the user provided --log
-        if sys.stdout is not sys.__stdout__:
+        # Windowed PyInstaller executables expose stdout/stderr as None.
+        if sys.stdout is None or sys.stderr is None:
             sys.stdout = _Null()
             sys.stderr = _Null()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Launch MCP Client for Azure")
+    parser = argparse.ArgumentParser(description="Launch MCP Client for Microsoft Foundry")
     default_log = _load_config_logfile()
     parser.add_argument(
         "--log",
@@ -125,9 +129,33 @@ def main() -> None:
         default=default_log,
         help="write stdout/stderr to file when windowed (overrides config)",
     )
+    parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     args, _ = parser.parse_known_args()
 
+    if args.smoke_test:
+        # A windowed PyInstaller executable otherwise turns import failures
+        # into a native modal that CI/terminal automation cannot read. Convert
+        # every smoke failure into a traceback file and deterministic exit code.
+        report_path = Path(
+            os.environ.get("MCPCLIENT_SMOKE_REPORT")
+            or (Path(tempfile.gettempdir()) / "mcpclient-smoke-report.txt")
+        )
+        try:
+            from agent_framework_foundry import FoundryChatClient as _foundry_client  # noqa: F401
+            from agent_framework_openai import (  # noqa: F401
+                OpenAIChatClient as _responses_client,
+                OpenAIChatCompletionClient as _chat_client,
+            )
+            from agent_framework_anthropic import AnthropicFoundryClient as _claude_client  # noqa: F401
+            from backend.main import app as _backend_app  # noqa: F401
+        except BaseException:
+            report_path.write_text(traceback.format_exc(), encoding="utf-8")
+            os._exit(1)
+        report_path.write_text("Packaged import smoke test passed.\n", encoding="utf-8")
+        os._exit(0)
+
     _setup_logging(args.log)
+    import webview
 
     # Run backend in a daemon thread so the main thread can own the GUI
     threading.Thread(target=run_backend, daemon=True).start()
@@ -136,7 +164,7 @@ def main() -> None:
     try:
         loading_html = LOADING_PAGE.read_text(encoding="utf-8")
     except FileNotFoundError:
-        loading_html = "<h1>MCP Client for Azure is starting…</h1>"
+        loading_html = "<h1>MCP Client for Microsoft Foundry is starting…</h1>"
 
     window = webview.create_window(
         WINDOW_TITLE,
@@ -148,12 +176,6 @@ def main() -> None:
     # wait_for_backend runs in a separate thread once the GUI loop starts
     webview.start(wait_for_backend, window)
 
-
-# Import ensures backend package is bundled by PyInstaller
-try:
-    import backend.main  # noqa: F401  # pylint: disable=unused-import
-except ImportError:
-    pass
 
 if __name__ == "__main__":
     main()

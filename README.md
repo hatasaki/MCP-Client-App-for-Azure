@@ -1,104 +1,222 @@
-# MCP Client for Azure
+# MCP Client for Microsoft Foundry
 
-A Model Context Protocol (MCP) client that integrates seamlessly with Azure OpenAI. It can connect to multiple MCP servers and includes a flexible tool-execution approval system.
+A desktop and container-ready Model Context Protocol (MCP) client for Microsoft Foundry. The backend uses Microsoft Agent Framework (MAF) for provider calls, agent sessions, streaming, function invocation, and MCP tools; the frontend is a React/Material UI chat application.
 
-> ### Related blog articles:
+> Related articles about the original Azure OpenAI version:
 > - [Chat UI MCP Client App Integrates Azure OpenAI and MCP Servers](https://medium.com/@hatasaki/chat-ui-mcp-client-app-integrates-azure-openai-and-mcp-servers-works-on-windows-and-mac-08f6ed2672b7)
-> - (Japanese) [Azure OpenAI と MCP を連携するチャット UI アプリを作りました](https://qiita.com/hatasaki/items/84316fff8db67bf39e0a)
+> - [Azure OpenAI と MCP を連携するチャット UI アプリを作りました](https://qiita.com/hatasaki/items/84316fff8db67bf39e0a)
 
-## Features
+![Application screenshot](assets/MCP_Client_for_Azure_Screenshot.png)
 
-- **Azure OpenAI Integration** – Works out-of-the-box with Azure OpenAI.
-- **Multiple MCP Server Types** – Supports STDIO, SSE, and HTTP.
-- **Secure MCP Server Authorization** - Supports OAuth2 flow.
-- **Tool Approval Dialog** – Choose *Allow*, *Allow All*, or *Deny* for each tool call.
-- **Saved Server Management** – Persist and reuse MCP server settings.
-- **Session Management** – Store every chat as a local file for later reload.
-- **Modern UI** – Built with Material-UI.
-- **Ready to Run** – Download single binary packaged for Windows/MacOS.
+## Highlights
 
-![screenshot](assets/MCP_Client_for_Azure_Screenshot.png)
+- **Microsoft Agent Framework runtime** with opaque MAF session persistence.
+- **Token streaming** with ordered Socket.IO events and partial-response display.
+- **Real cancellation** of the active agent task, including approval waits.
+- **Batched tool approval** with per-call decisions and session-scoped “Always allow all”.
+- **MAF-native MCP tools** over Streamable HTTP or STDIO.
+- **OAuth 2.0 for remote MCP servers** with flow-specific callback routing.
+- **Typed provider parameters** where empty means omit and explicit `false`, `0`, and `none` remain distinct.
+- **Atomic settings/session persistence** and one-time legacy Azure settings migration.
+- **Windows, macOS, and headless container packaging**.
 
-Repository Link: https://github.com/hatasaki/MCP-Client-App-for-Azure
+## Supported Foundry routes
 
-## Getting Started
+| Endpoint kind | API | Version mode | Authentication |
+|---|---|---|---|
+| Foundry Project | Responses | `v1` | Microsoft Entra ID only |
+| Model endpoint | Responses | `v1` or dated Azure API | API key or Entra ID |
+| Model endpoint | Chat Completions | `v1` or dated Azure API | API key or Entra ID |
+| Model endpoint | Claude Messages | Provider version | API key or Entra ID |
 
-### 0. Download the Binary
-1. Grab the latest release from GitHub: https://github.com/hatasaki/MCP-Client-App-for-Azure/releases
-2. Extract an executable file
-> **Windows users**
-> 1. After extracting, copy **`mcpclient.exe`** to any folder and double-click it to launch.
-> 2. A confirmation message will appear when you run the program. Please follow the on-screen instructions.
+Project endpoints must end in `/api/projects/{project-name}`. MAF `FoundryChatClient` authenticates this route with Entra ID. To use a resource API key, select **Model endpoint**; model endpoints do not expose Project-scoped connections or other Project capabilities.
 
-> **macOS users**
-> 1. After extracting, copy **`mcpclient.app`** to any folder and double-click it, or drag it into your **Applications** folder.
-> 2. The first time you start the app, macOS may block it because it was downloaded from the internet. Open **System Settings → Privacy & Security** and click **Open Anyway** to allow the application to run.
+Claude support uses the beta MAF Anthropic connector. Its `max_tokens` setting is required.
 
-### 1. First Launch – Choose a Data Directory
-- When you start MCP Client for Azure for the first time, a dialog asks where to store settings and chat history.  The path you pick is saved to `.mcpclient/mcpclient.conf` at your home directory (`%USERPROFILE%\.mcpclient\mcpclient.conf` on Windows, `$HOME/.mcpclient/mcpclient.conf` on macOS).
+## Desktop installation
 
-### 2. Configure Azure OpenAI
-1. Launch the app and click **Azure Settings**.
-2. Enter your **Endpoint URL**, **Deployment name**, **API version**, and  (optionally) an **API key**.
-   - If the API key field is left **blank**, the client will authenticate with **Entra ID (Azure AD)** using the credentials from browser login or `az login`.
-   - In addition, you can configure system prompt, temperature, max_tokens.
+1. Download the latest archive from [GitHub Releases](https://github.com/hatasaki/MCP-Client-App-for-Azure/releases).
+2. Extract the archive. The standard Windows archive contains the original single `mcpclient.exe`. If an enterprise Code Integrity policy blocks `_MEI*` DLL loading, use the `windows-onedir` archive, keep its folder together, and start `mcpclient-onedir/mcpclient.exe`. On macOS, start `mcpclient.app`.
+3. On first launch, choose a directory for settings and chat history.
 
-### 3. Register MCP Servers
-1. Click **MCP Servers**.
-2. Select **Add New Server** and fill in the details.
+On macOS, an unsigned downloaded app might require **System Settings → Privacy & Security → Open Anyway**.
 
-**STDIO example**
+Windows desktop builds use the current pywebview WebView2 backend. Windows 10/11 normally includes the Microsoft Edge WebView2 Runtime; install or repair that runtime if the application window cannot be created.
+
+## Configure Microsoft Foundry
+
+Open **Foundry Settings**, then select the endpoint kind, API, version mode, authentication method, and model deployment.
+
+- Project endpoints lock API to Responses, version to `v1`, and authentication to Entra ID.
+- Model endpoints permit API key or Entra ID.
+- API keys support explicit **keep**, **replace**, and **clear** behavior. Secrets are never returned by the REST settings API or stored in browser local storage.
+- Optional parameter fields are omitted when empty. Boolean `false`, numeric `0`, and reasoning effort `none` are sent explicitly.
+
+`DefaultAzureCredential` is used for Entra ID. A developer can normally authenticate with Azure CLI, environment/workload identity, managed identity, or interactive browser credentials supported by Azure Identity.
+
+### Legacy migration
+
+If `FoundrySettings.json` does not yet exist, a valid legacy `AzureOpenAI.json` is migrated once to a Model endpoint configuration. The original file is preserved as `AzureOpenAI.json.pre-foundry.bak`.
+
+## Connect MCP servers
+
+Open **MCP Servers** and add one of these transports:
+
+1. **HTTP** — MCP Streamable HTTP, with optional headers and OAuth.
+2. **STDIO** — executable, arguments, working directory, and environment variables.
+3. **SSE** — retained as a display/config alias for Streamable HTTP. Legacy GET+POST SSE transport is not used.
+
+Key/value editors automatically append a blank row; a separate Add button is not required.
+
+### STDIO examples
+
+Windows:
+
+```text
+Name: Files
+Protocol: STDIO
+Executable Path: npx.cmd
+Arguments: -y @modelcontextprotocol/server-filesystem C:\work
 ```
-Name: STDIO MCP Server
-Type: STDIO
-Command: npx
-Args: -y @hoge/fuga
-Env: HOGE_USER=john
+
+macOS apps launched from Finder inherit a restricted `PATH`. Use an absolute executable path or add the needed locations to the server environment, such as `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`.
+
+### HTTP example
+
+```text
+Name: Remote tools
+Protocol: HTTP
+URL: https://example.test/mcp
+Header: Authorization = Bearer ...
 ```
-> **Platform notes**
-> - **macOS (.app build):** Apps started from Finder inherit a minimal `PATH`. If `npx`/`node` is installed via Homebrew (e.g. `/opt/homebrew/bin` or `/usr/local/bin`), add that directory to **Env → PATH**:  
->   **`PATH=/opt/homebrew/bin:/bin:/usr/bin:/usr/local/bin:$PATH`**
-> - **Windows:** Specify **`npx.cmd`** instead of `npx` for **Command**.
 
-**HTTP example**
+Remote authorization follows the MCP OAuth flow. The app opens the authorization URL and receives the callback on its local backend.
+
+## Chat, tools, approvals, and cancellation
+
+1. Select **New Chat**.
+2. Select individual MCP tools or all tools from one server.
+3. Send a message and review streamed output.
+4. For each approval batch, approve selected calls, deny all calls, or enable **Always allow all** for that chat session.
+5. Select Stop to cancel the real in-flight task. Partial text is retained with `cancelled` status but is not replayed as completed history.
+
+Tool IDs are qualified as `{server-id}:{remote-tool-name}`, preventing collisions between servers. To force one selected tool on the first model turn, prefix a prompt with its qualified ID, for example:
+
+```text
+#weather-server:get_forecast What is the forecast for Seattle?
 ```
-Name: Remote HTTP Server
-Type: HTTP
-URL : http://remote.mcp.io/mcp
-Header:
-  "user-key": "secret"
+
+When Foundry settings change, provider-specific MAF state is discarded. Only completed user/assistant text is replayed under the new settings; cancelled, interrupted, streaming, and error messages are excluded.
+
+## Data and security
+
+The desktop app stores the selected data directory in:
+
+- Windows: `%USERPROFILE%\.mcpclient\mcpclient.conf`
+- macOS/Linux: `$HOME/.mcpclient/mcpclient.conf`
+
+The data directory contains:
+
+- `FoundrySettings.json` — endpoint, parameters, and an API key when configured.
+- `mcp.json` — saved MCP definitions, including configured headers/environment values.
+- `sessions/*.json` — visible messages plus opaque MAF session state.
+
+These files can contain secrets. Protect the directory with operating-system permissions and do not commit or share it. The browser receives only redacted Foundry settings.
+
+Optional keys in `mcpclient.conf`:
+
+```json
+{
+  "data_dir": "C:\\path\\to\\data",
+  "port": 3001,
+  "log_file": "C:\\path\\to\\mcpclient.log"
+}
 ```
-> **Support OAuth2 flow for HTTP/SSE MCP server authorization**
-> - In accordance with the [MCP authorization specification dated 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization).
-> - This app obtains a token to access a MCP server by opening browser for user consent and receiving a callback.
 
-### 4. Start Chatting
-1. Click **New Session**.
-2. Pick an MCP tool with **Select Tool**.
-3. Type a message and send.
-4. When a tool is called an approval dialog appears:
-   - **Allow** – Run this one tool.
-   - **Allow All** – Auto-approve all tools for this session (no more dialogs).
-   - **Deny** – Cancel the tool call.
-5. If you choose **Allow All**, the flag `autoApproveAll` is saved for that session so you will not be asked again.
-6. All messages and tool results are stored in `data/sessions/<id>.json` and can be reopened from **Session List** after restarting the app.
-7. Force a tool call – Prefix your message with `#<toolName>` to make sure the assistant calls that tool. For example, writing `#weather What's the weather today?` will always invoke the `weather` tool. The tool name must match one selected in **Select Tool**. The prefix is stripped before sending so the MCP server receives only the original question.
+## Run from source
 
-## Optional Settings
-You can use optional settings by adding following configuration to mcpclient.conf (`%USERPROFILE%\.mcpclient\mcpclient.conf` on Windows, **`$HOME/.mcpclient/mcpclient.conf`** on Linux).
+Prerequisites: Python 3.10 or newer and Node.js 24 LTS.
 
- - logging: output log to specified file
-   - `"log_file": "<path to your file>"`
- - internal server port: specify port number(default is 3001)
-   - `"port": <port number>`
+```text
+python -m venv .venv
+.venv/Scripts/python -m pip install -r requirements-desktop.txt   # Windows
+cd client
+npm ci --legacy-peer-deps
+npm run build
+cd ..
+.venv/Scripts/python app_runner.py
+```
 
+Use `.venv/bin/python` instead on macOS/Linux.
+
+For a headless backend, install `requirements.txt`, set `MCPCLIENT_HEADLESS=1` and optionally `MCPCLIENT_DATA_DIR`, then run `python -m uvicorn backend.main:app --host 0.0.0.0 --port 3001`. Set `MCPCLIENT_CALLBACK_BASE_URL` when an MCP OAuth callback must use a different externally reachable origin. Requests are same-origin by default; set a comma-separated `MCPCLIENT_ALLOWED_ORIGINS` only when a separate frontend origin is required. `MCPCLIENT_OAUTH_TIMEOUT_SECONDS` defaults to 300.
+
+## Container
+
+The image runs as a non-root user, stores data in `/data`, and exposes a health check at `/healthz`.
+
+```text
+docker build -t mcp-client-foundry .
+docker run --rm -p 3001:3001 -v mcpclient-data:/data mcp-client-foundry
+```
+
+The default image build runs the Node 24 production build inside Docker. In a network-restricted environment, first run `npm run build` in `client`, then use `docker build --target runtime-prebuilt -t mcp-client-foundry .`; this uses the checked local `client/build` output while keeping the same Python runtime image.
+
+For Entra ID in a container, provide a supported workload/environment/managed identity configuration. Interactive desktop login is not assumed.
+
+## Tests
+
+```text
+python -m pytest -m "not live_foundry" -q
+cd client
+npm test -- --watchAll=false
+npm run build
+```
+
+Provider wire tests use mock HTTP transports and verify exact URLs, authentication headers, typed request bodies, and explicit omit semantics.
+
+Install `requirements-dev.txt` instead of `requirements.txt` before running Python tests.
+
+The live Foundry test is opt-in because it requires credentials, network access, and can incur usage charges:
+
+```text
+RUN_FOUNDRY_LIVE_TESTS=1
+FOUNDRY_PROJECT_ENDPOINT=https://resource.services.ai.azure.com/api/projects/project-name
+FOUNDRY_MODEL=model-deployment
+python -m pytest tests/test_live_foundry.py -q
+```
+
+No endpoint, model, or credential is hardcoded in the test suite.
+
+## Packaging
+
+Build the React client first. Windows has two specs: `pyinstaller --clean mcpclient_win.spec` preserves the original one-file distribution, while `pyinstaller --clean mcpclient_win_onedir.spec` creates the compatibility onedir distribution. Use `pyinstaller --clean mcpclient_mac.spec` on macOS. The specs collect concrete MAF provider modules, MCP modules, distribution metadata, and runtime assets. The onedir option is provided because some enterprise Code Integrity policies reject DLLs dynamically extracted by unsigned one-file applications under `_MEI*` with Bad Image status `0xc0e90002`.
+
+### Release process
+
+`version_info.txt` remains the single source of truth for desktop package and GitHub Release versions. Choosing and committing the next version is intentionally a manual release-owner action; GitHub Actions never rewrites the repository version.
+
+1. From an up-to-date `main` branch, set the next four-part Windows version:
+
+  ```text
+  python scripts/version.py set 0.5.0.0
+  python scripts/version.py verify
+  ```
+
+  The command updates `filevers`, `prodvers`, `FileVersion`, and `ProductVersion` together. Direct manual editing remains possible, but all four values must match or CI stops before building.
+
+2. Review the change, run the test/build commands above, commit `version_info.txt`, and push the commit to `main`.
+3. In GitHub Actions, dispatch **Build and Release** from `main`. The workflow requires the version to be greater than the latest `v*` tag and rejects an existing tag before starting platform builds.
+4. The workflow builds and smoke-tests Windows one-file, Windows onedir, and macOS packages; publishes SHA-256 checksums; creates tag `v<version>` at the dispatched commit; and creates one GitHub Release containing all assets.
+
+The **Build Windows Packages** workflow is a non-release diagnostic workflow. It uploads Windows artifacts for the selected commit but deliberately does not create a tag or GitHub Release, preventing duplicate or partial releases.
+
+The separate container workflow publishes both `:<version>` and `:latest` tags to GHCR using the same validated `version_info.txt` value.
 
 ## Disclaimer
-This sample application is for testing, evaluation, and demos only. Use it at your own risk. It is not affiliated with or endorsed by the developer’s organization.
 
-## Contributing
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/). For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+This sample application is for testing, evaluation, and demos. Use it at your own risk. It is not an official Microsoft application.
 
-## License
+## Contributing and license
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project follows the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/) and is licensed under the [MIT License](LICENSE).

@@ -1,7 +1,15 @@
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
+
+from app.foundry_config import (
+    FoundrySettings,
+    FoundrySettingsStore,
+    FoundrySettingsWrite,
+)
 
 # NOTE: The actual DATA_DIR will be determined later after checking user configuration.
 
@@ -35,7 +43,16 @@ def _save_data_dir(path: Path) -> None:
     """Persist selected *path* to the user config file."""
     try:
         _USER_CONF_DIR.mkdir(parents=True, exist_ok=True)
-        _USER_CONF_PATH.write_text(json.dumps({"data_dir": str(path)}, ensure_ascii=False, indent=2), encoding="utf-8")
+        settings: dict[str, Any] = {}
+        if _USER_CONF_PATH.is_file():
+            try:
+                existing = json.loads(_USER_CONF_PATH.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    settings.update(existing)
+            except (OSError, json.JSONDecodeError):
+                pass
+        settings["data_dir"] = str(path)
+        _USER_CONF_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         # Non-fatal; continue without saving
         print("[WARN] Failed to write mcpclient.conf", file=sys.stderr)
@@ -55,7 +72,10 @@ def _prompt_user_for_data_dir(initial_dir: Path | None = None) -> Path | None:
         root.withdraw()  # Hide the main window
         # Windows: keep the dialog on top
         root.attributes("-topmost", True)
-        dir_selected = _fd.askdirectory(title="Select data directory for MCP Client for Azure", initialdir=str(initial_dir or Path.home()))
+        dir_selected = _fd.askdirectory(
+            title="Select data directory for MCP Client for Microsoft Foundry",
+            initialdir=str(initial_dir or Path.home()),
+        )
         root.destroy()
         if dir_selected:
             return Path(dir_selected)
@@ -68,14 +88,18 @@ def _prompt_user_for_data_dir(initial_dir: Path | None = None) -> Path | None:
 # Determine DATA_DIR using saved config or user prompt, then fallback
 # ---------------------------------------------------------------------------
 
-_saved_dir = _load_saved_data_dir()
+_env_data_dir = os.environ.get("MCPCLIENT_DATA_DIR")
+_saved_dir = Path(_env_data_dir).expanduser().resolve() if _env_data_dir else _load_saved_data_dir()
 if _saved_dir is None:
-    _chosen_dir = _prompt_user_for_data_dir()
+    _chosen_dir = None if os.environ.get("MCPCLIENT_HEADLESS") == "1" else _prompt_user_for_data_dir()
     if _chosen_dir is None:
-        print("[ERROR] Data directory was not selected. Exiting.", file=sys.stderr)
-        sys.exit(1)
+        _chosen_dir = _USER_CONF_DIR / "data"
+        _chosen_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Using default data directory: {_chosen_dir}", file=sys.stderr)
     _saved_dir = _chosen_dir
     _save_data_dir(_saved_dir)
+
+_saved_dir.mkdir(parents=True, exist_ok=True)
 
 # Finalize DATA_DIR (no fallback)
 DATA_DIR = _saved_dir
@@ -85,62 +109,32 @@ DATA_DIR = _saved_dir
 # ---------------------------------------------------------------------------
 
 AZURE_CONF_PATH = DATA_DIR / "AzureOpenAI.json"
+FOUNDRY_CONF_PATH = DATA_DIR / "FoundrySettings.json"
 MCP_CONF_PATH = DATA_DIR / "mcp.json"
 
-# Default system prompt
-DEFAULT_SYSTEM_PROMPT = (
-    "Based on the user's instructions, analyze the user's intent, define goals to achieve that intent, "
-    "invoke and execute necessary tools until the goals are accomplished, and finally return the response to the user."
-)
+foundry_settings_store = FoundrySettingsStore(FOUNDRY_CONF_PATH, AZURE_CONF_PATH)
+
+
+def load_foundry_settings() -> FoundrySettings | None:
+    """Load current Foundry settings, migrating legacy Azure settings once."""
+    ensure_data_dir()
+    return foundry_settings_store.load()
+
+
+def save_foundry_settings(settings: FoundrySettings) -> None:
+    """Persist validated Foundry settings atomically."""
+    ensure_data_dir()
+    foundry_settings_store.save(settings)
+
+
+def update_foundry_settings(payload: FoundrySettingsWrite) -> FoundrySettings:
+    """Resolve secret actions and atomically persist Foundry settings."""
+    ensure_data_dir()
+    return foundry_settings_store.update(payload)
 
 
 def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def load_or_create_azure_conf() -> Dict[str, Any]:
-    ensure_data_dir()
-    if AZURE_CONF_PATH.exists():
-        # ensure required keys exist
-        data = json.loads(AZURE_CONF_PATH.read_text(encoding="utf-8"))
-        changed = False
-        # Ensure keys exist even if blank so client round-trips preserve empties
-        for k in ("temperature", "top_p", "max_tokens", "api_type", "reasoning_effort", "verbosity", "max_completion_tokens"):
-            if k not in data:
-                # default for api_type is "chat"
-                if k == "api_type":
-                    data[k] = "chat"
-                else:
-                    data[k] = ""
-                changed = True
-        if changed:
-            AZURE_CONF_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        return data
-    # Create default config
-    cfg = {
-        "endpoint": "",
-        "api_key": "",
-        "api_version": "",
-        "deployment": "",
-        # Prompt and generation parameters (added temperature, top_p, max_tokens)
-        # Default generation parameters
-        "system_prompt": DEFAULT_SYSTEM_PROMPT,
-        "temperature": "",
-        "top_p": "",
-        "max_tokens": "",
-        "api_type": "chat",  # new field: 'chat' or 'response'
-        # New Responses API (reasoning) parameters
-        "reasoning_effort": "",   # 'minimal' | 'low' | 'medium' | 'high' (omit if blank/none)
-        "verbosity": "",          # 'low' | 'medium' | 'high' (omit if blank/none)
-        "max_completion_tokens": "",  # integer (omit if blank)
-    }
-    AZURE_CONF_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-    return cfg
-
-
-def save_azure_conf(cfg: Dict[str, Any]) -> None:
-    ensure_data_dir()
-    AZURE_CONF_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def load_mcp_servers() -> List[Dict[str, Any]]:
@@ -163,7 +157,25 @@ def load_mcp_servers() -> List[Dict[str, Any]]:
 
 def save_mcp_servers(servers: List[Dict[str, Any]]) -> None:
     ensure_data_dir()
-    # Save as dict with names
     conf = {srv.get("name", f"server{idx}"): {k: v for k, v in srv.items() if k != "name"}
             for idx, srv in enumerate(servers)}
-    MCP_CONF_PATH.write_text(json.dumps({"servers": conf}, indent=2, ensure_ascii=False), encoding="utf-8")
+    encoded = json.dumps({"servers": conf}, indent=2, ensure_ascii=False)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{MCP_CONF_PATH.name}.",
+        suffix=".tmp",
+        dir=str(MCP_CONF_PATH.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.chmod(temporary_name, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary_name, MCP_CONF_PATH)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)

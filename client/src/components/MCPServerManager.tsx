@@ -34,6 +34,7 @@ import {
 } from '@mui/icons-material';
 
 import { MCPServerConfig } from '../types';
+import KeyValueRows, { KeyValueRow, recordToRows, rowsToRecord } from './KeyValueRows';
 
 interface MCPServerManagerProps {
   open: boolean;
@@ -125,39 +126,37 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
   }, [open, socket]);
   const [newServer, setNewServer] = useState<Partial<MCPServerConfig>>({
     name: '',
-    transport: 'stdio',
+    transport: 'http',
     command: '',
     args: [],
     env: {},
     url: '',
     headers: {},
   });
-  const [envKey, setEnvKey] = useState('');
-  const [envValue, setEnvValue] = useState('');
-  const [headerKey, setHeaderKey] = useState('');
-  const [headerValue, setHeaderValue] = useState('');
+  const [envRows, setEnvRows] = useState<KeyValueRow[]>(recordToRows());
+  const [headerRows, setHeaderRows] = useState<KeyValueRow[]>(recordToRows());
   const [argsInput, setArgsInput] = useState('');
 
-  const handleAddHeader = () => {
-    if (!headerKey || !headerValue) return;
-        
-    setNewServer((prev: Partial<MCPServerConfig>) => {
-      const updatedServer = {
-        ...prev,
-        headers: {
-          ...prev.headers,
-          [headerKey]: headerValue,
-        },
-      };
-      return updatedServer;
-    });
-    
-    setHeaderKey('');
-    setHeaderValue('');
+  const rowsAreInvalid = (rows: KeyValueRow[]) => {
+    const active = rows.filter((row) => row.key || row.value);
+    const keys = active.map((row) => row.key.trim());
+    return active.some((row) => !row.key.trim()) || new Set(keys).size !== keys.length;
   };
 
   const handleAddServer = () => {
     if (!socket || !newServer.name || !newServer.transport) return;
+    if (rowsAreInvalid(envRows) || rowsAreInvalid(headerRows)) {
+      setError('Environment variable and header keys must be non-empty and unique.');
+      return;
+    }
+    if (newServer.transport === 'stdio' && !newServer.command?.trim()) {
+      setError('Executable Path is required for STDIO.');
+      return;
+    }
+    if (newServer.transport !== 'stdio' && !newServer.url?.trim()) {
+      setError('URL is required for HTTP transport.');
+      return;
+    }
 
     const args = argsInput
       .split(' ')
@@ -167,6 +166,8 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
     const serverConfig: MCPServerConfig = {
       ...newServer,
       args,
+      env: rowsToRecord(envRows),
+      headers: rowsToRecord(headerRows),
     } as MCPServerConfig;
 
     // Add debug log
@@ -174,7 +175,7 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
     
     setNewServer({
       name: '',
-      transport: 'stdio',
+      transport: 'http',
       command: '',
       args: [],
       env: {},
@@ -182,10 +183,8 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
       headers: {},
     });
     setArgsInput('');
-    setEnvKey('');
-    setEnvValue('');
-    setHeaderKey('');
-    setHeaderValue('');
+    setEnvRows(recordToRows());
+    setHeaderRows(recordToRows());
     setShowAddForm(false);
   };
 
@@ -210,37 +209,6 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
   const handleDeleteSavedServer = (serverName: string) => {
     if (!socket) return;
     socket.emit('deleteSavedServer', serverName);
-  };
-
-  const handleAddEnvVar = () => {
-    if (!envKey || !envValue) return;
-    
-    setNewServer((prev: Partial<MCPServerConfig>) => ({
-      ...prev,
-      env: {
-        ...prev.env,
-        [envKey]: envValue,
-      },
-    }));
-    
-    setEnvKey('');
-    setEnvValue('');
-  };
-
-  const handleRemoveEnvVar = (key: string) => {
-    setNewServer((prev: Partial<MCPServerConfig>) => {
-      const newEnv = { ...prev.env };
-      delete newEnv[key];
-      return { ...prev, env: newEnv };
-    });
-  };
-
-  const handleRemoveHeader = (key: string) => {
-    setNewServer((prev: Partial<MCPServerConfig>) => {
-      const newHeaders = { ...prev.headers };
-      delete newHeaders[key];
-      return { ...prev, headers: newHeaders };
-    });
   };
 
   const getTransportColor = (transport: string) => {
@@ -378,9 +346,9 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
                   label="Protocol"
                   onChange={(e) => setNewServer((prev: Partial<MCPServerConfig>) => ({ ...prev, transport: e.target.value as any }))}
                 >
-                  <MenuItem value="stdio">STDIO</MenuItem>
-                  <MenuItem value="sse">SSE</MenuItem>
                   <MenuItem value="http">HTTP</MenuItem>
+                  <MenuItem value="stdio">STDIO</MenuItem>
+                  <MenuItem value="sse">SSE (Streamable HTTP alias)</MenuItem>
                 </Select>
               </FormControl>
             </Box>
@@ -420,33 +388,12 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
                     <Typography component="div">Environment Variables</Typography>
                   </AccordionSummary>
                   <AccordionDetails>
-                    <Box sx={{ display: 'flex', gap: 1, mb: 2 }}>
-                      <TextField
-                        label="Key"
-                        value={envKey}
-                        onChange={(e) => setEnvKey(e.target.value)}
-                        size="small"
-                      />
-                      <TextField
-                        label="Value"
-                        value={envValue}
-                        onChange={(e) => setEnvValue(e.target.value)}
-                        size="small"
-                      />
-                      <Button onClick={handleAddEnvVar} disabled={!envKey || !envValue}>
-                        Add
-                      </Button>
-                    </Box>
-
-                    {newServer.env && Object.entries(newServer.env).map(([key, value]) => (
-                      <Box key={key} sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                        <Typography sx={{ flex: 1 }}>{key}</Typography>
-                        <Typography sx={{ flex: 1 }}>{String(value)}</Typography>
-                        <IconButton onClick={() => handleRemoveEnvVar(key)} size="small">
-                          <DeleteIcon />
-                        </IconButton>
-                      </Box>
-                    ))}
+                    <KeyValueRows
+                      rows={envRows}
+                      onChange={setEnvRows}
+                      keyLabel="Environment variable"
+                      valueLabel="Value"
+                    />
                   </AccordionDetails>
                 </Accordion>
               </Box>
@@ -454,6 +401,11 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
 
             {(newServer.transport === 'sse' || newServer.transport === 'http') && (
               <Box>
+                {newServer.transport === 'sse' && (
+                  <Alert severity="warning" sx={{ mb: 2 }}>
+                    SSE is a display alias for MCP Streamable HTTP. Legacy GET + POST SSE endpoints are not supported.
+                  </Alert>
+                )}
                 <TextField
                   fullWidth
                   label="URL"
@@ -468,9 +420,9 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
                   <AccordionSummary expandIcon={<ExpandMoreIcon />}>
                     <Typography component="div">
                       HTTP Headers
-                      {newServer.headers && Object.keys(newServer.headers).length > 0 && (
+                      {headerRows.some((row) => row.key.trim()) && (
                         <Chip 
-                          label={Object.keys(newServer.headers).length} 
+                          label={headerRows.filter((row) => row.key.trim()).length}
                           size="small" 
                           color="primary" 
                           sx={{ ml: 1 }}
@@ -479,33 +431,12 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
                     </Typography>
                   </AccordionSummary>
                   <AccordionDetails>
-                    <Box sx={{ display: 'flex', gap: 1, mb: 2 }}>
-                      <TextField
-                        label="Header"
-                        value={headerKey}
-                        onChange={(e) => setHeaderKey(e.target.value)}
-                        size="small"
-                      />
-                      <TextField
-                        label="Value"
-                        value={headerValue}
-                        onChange={(e) => setHeaderValue(e.target.value)}
-                        size="small"
-                      />
-                      <Button onClick={handleAddHeader} disabled={!headerKey || !headerValue}>
-                        Add
-                      </Button>
-                    </Box>
-
-                    {newServer.headers && Object.entries(newServer.headers).map(([key, value]) => (
-                      <Box key={key} sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                        <Typography sx={{ flex: 1 }}>{key}</Typography>
-                        <Typography sx={{ flex: 1 }}>{String(value)}</Typography>
-                        <IconButton onClick={() => handleRemoveHeader(key)} size="small">
-                          <DeleteIcon />
-                        </IconButton>
-                      </Box>
-                    ))}
+                    <KeyValueRows
+                      rows={headerRows}
+                      onChange={setHeaderRows}
+                      keyLabel="Header"
+                      valueLabel="Value"
+                    />
                   </AccordionDetails>
                 </Accordion>
               </Box>
@@ -525,7 +456,7 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
                   setShowAddForm(false);
                   setNewServer({
                     name: '',
-                    transport: 'stdio',
+                    transport: 'http',
                     command: '',
                     args: [],
                     env: {},
@@ -533,10 +464,8 @@ const MCPServerManager: React.FC<MCPServerManagerProps> = ({
                     headers: {},
                   });
                   setArgsInput('');
-                  setEnvKey('');
-                  setEnvValue('');
-                  setHeaderKey('');
-                  setHeaderValue('');
+                  setEnvRows(recordToRows());
+                  setHeaderRows(recordToRows());
                 }}
               >
                 Cancel

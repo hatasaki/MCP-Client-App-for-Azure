@@ -1,7 +1,6 @@
 import React from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import rehypeRaw from 'rehype-raw';
 import { Box, Typography, Paper } from '@mui/material';
 
 interface MarkdownRendererProps {
@@ -18,7 +17,6 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, color = 'i
       overflowWrap: 'break-word',
     }}><ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeRaw]}
         components={{
           // 見出し
           h1: ({ children }) => (
@@ -332,100 +330,6 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, color = 'i
             />
           ),
           
-          // HTMLタグ対応
-          span: ({ style, children, ...props }) => (
-            <Box
-              component="span"
-              sx={{
-                color: style?.color || color,
-                backgroundColor: style?.backgroundColor,
-                fontSize: style?.fontSize,
-                fontWeight: style?.fontWeight,
-                fontStyle: style?.fontStyle,
-                textDecoration: style?.textDecoration,
-                ...style,
-              }}
-              {...props}
-            >
-              {children}
-            </Box>
-          ),
-          
-          div: ({ style, children, ...props }) => (
-            <Box
-              component="div"
-              sx={{
-                color: style?.color || color,
-                backgroundColor: style?.backgroundColor,
-                fontSize: style?.fontSize,
-                fontWeight: style?.fontWeight,
-                fontStyle: style?.fontStyle,
-                textDecoration: style?.textDecoration,
-                padding: style?.padding,
-                margin: style?.margin,
-                border: style?.border,
-                borderRadius: style?.borderRadius,
-                ...style,
-              }}
-              {...props}
-            >
-              {children}
-            </Box>
-          ),
-          
-          // その他のHTMLタグ
-          b: ({ children }) => (
-            <Box component="b" sx={{ fontWeight: 'bold', color }}>
-              {children}
-            </Box>
-          ),
-          
-          i: ({ children }) => (
-            <Box component="i" sx={{ fontStyle: 'italic', color }}>
-              {children}
-            </Box>
-          ),
-          
-          u: ({ children }) => (
-            <Box component="u" sx={{ textDecoration: 'underline', color }}>
-              {children}
-            </Box>
-          ),
-          
-          s: ({ children }) => (
-            <Box component="s" sx={{ textDecoration: 'line-through', color }}>
-              {children}
-            </Box>
-          ),
-          
-          mark: ({ children, style }) => (
-            <Box
-              component="mark"
-              sx={{
-                backgroundColor: style?.backgroundColor || (color === 'white' ? 'rgba(255,255,0,0.3)' : 'yellow'),
-                color: style?.color || color,
-                padding: '0.1em 0.2em',
-                borderRadius: 1,
-                ...style,
-              }}
-            >
-              {children}
-            </Box>
-          ),
-          
-          small: ({ children, style }) => (
-            <Typography
-              component="small"
-              variant="caption"
-              sx={{
-                color: style?.color || color,
-                fontSize: '0.8em',
-                ...style,
-              }}
-            >
-              {children}
-            </Typography>
-          ),
         }}
       >
         {content}

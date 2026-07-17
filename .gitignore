@@ -1,5 +1,5 @@
 # -------------------------------------------------------
-# MCP Client for Azure – Electron (React) + Python monorepo
+# MCP Client for Microsoft Foundry – React + Python monorepo
 # -------------------------------------------------------
 
 # ─── Node / React / Electron ───────────────────────────
@@ -27,6 +27,7 @@ ENV/
 __pycache__/
 .mypy_cache/
 .pytest_cache/
+.tmp/
 *.py[cod]
 *.pyd
 
@@ -43,7 +44,9 @@ yarn-error.log*
 # ─── Environment / secrets ─────────────────────────────
 data/
 AzureOpenAI.json
+FoundrySettings.json
 mcp.json
+sessions/
 .env
 
 # ─── IDE / OS miscellanea ─────────────────────────────
@@ -56,4 +59,5 @@ Thumbs.db
 *.tgz
 *.tar.gz
 *.zip
+SHA256SUMS*.txt
 # End of .gitignore

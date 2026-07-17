@@ -1,0 +1,4 @@
+-r requirements-dev.txt
+
+# Packaging toolchain validated by CI and the local one-file/onedir smoke tests.
+pyinstaller==6.21.0

@@ -1,6 +1,6 @@
 {
-  "short_name": "MCP Client for Azure",
-  "name": "MCP Client for Azure",
+  "short_name": "MCP Client for Foundry",
+  "name": "MCP Client for Microsoft Foundry",
   "icons": [
     {
       "src": "favicon.ico",

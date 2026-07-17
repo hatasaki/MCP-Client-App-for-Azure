@@ -1,5 +1,6 @@
 # Workflow: build & push Docker image to GHCR with `latest` tag
 name: container-release
+run-name: Publish container from ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
@@ -14,15 +15,85 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    env:
+      MCPCLIENT_HEADLESS: '1'
+      MCPCLIENT_DATA_DIR: ${{ github.workspace }}/.tmp/mcpclient-test-data
+      CI: 'true'
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-test.txt
+
+      - name: Check Python dependencies
+        run: python -m pip check
+
+      - name: Read package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/version.py verify
+          echo "version=$(python scripts/version.py get)" >> "$GITHUB_OUTPUT"
+
+      - name: Run Python tests
+        run: python -m pytest -m "not live_foundry" -q
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci --legacy-peer-deps
+
+      - name: Run React tests
+        working-directory: client
+        run: npm test -- --watchAll=false
+
+      - name: Audit production client dependencies
+        working-directory: client
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Build React client
+        working-directory: client
+        run: npm run build
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build local smoke image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: runtime-prebuilt
+          load: true
+          tags: mcp-client-foundry:smoke
+          platforms: linux/amd64
+          cache-from: type=gha
+
+      - name: Smoke-test container backend import
+        run: docker run --rm mcp-client-foundry:smoke python -c "import backend.main; print('container backend import OK')"
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -34,16 +105,25 @@ jobs:
           REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           echo "repo=$REPO" >> "$GITHUB_OUTPUT"
 
-      - name: "Build & Push image (latest)"
-        uses: docker/build-push-action@v5
+      - name: Build and push versioned images
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          target: runtime-prebuilt
           push: true
-          tags: "ghcr.io/${{ steps.repo.outputs.repo }}:latest"
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.repo }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.repo.outputs.repo }}:latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
           platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Show summary
         run: |
-          echo "Image pushed: ghcr.io/${{ steps.repo.outputs.repo }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "Images pushed:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ghcr.io/${{ steps.repo.outputs.repo }}:${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ghcr.io/${{ steps.repo.outputs.repo }}:latest" >> "$GITHUB_STEP_SUMMARY"

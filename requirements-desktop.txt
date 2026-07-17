@@ -1,0 +1,4 @@
+-r requirements.txt
+
+pywebview==6.2.1
+requests==2.34.2

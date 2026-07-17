@@ -19,7 +19,7 @@ const AboutDialog: React.FC<AboutDialogProps> = ({ open, onClose }) => {
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
       <DialogTitle sx={{ textAlign: 'center', pb: 1 }}>
         <Typography variant="h5" component="div" color="primary" fontWeight="bold">
-          MCP Client for Azure
+          MCP Client for Microsoft Foundry
         </Typography>
       </DialogTitle>
       <DialogContent sx={{ textAlign: 'center', py: 2 }}>

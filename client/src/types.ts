@@ -1,7 +1,14 @@
+export type EndpointKind = 'project' | 'model';
+export type ApiType = 'responses' | 'chat_completions' | 'claude_messages';
+export type VersionMode = 'v1' | 'dated' | 'provider';
+export type AuthType = 'entra_id' | 'api_key';
+export type SecretAction = 'keep' | 'set' | 'clear';
+export type MessageStatus = 'streaming' | 'completed' | 'cancelled' | 'interrupted' | 'error';
+
 export interface MCPServerConfig {
   id?: string;
   name: string;
-  transport: 'stdio' | 'sse' | 'http';
+  transport: 'http' | 'stdio' | 'sse';
   command?: string;
   args?: string[];
   env?: Record<string, string>;
@@ -11,90 +18,179 @@ export interface MCPServerConfig {
 }
 
 export interface MCPTool {
+  id: string;
+  qualifiedId: string;
   name: string;
+  originalName: string;
+  displayName: string;
   description: string;
-  parameters: any;
+  parameters: Record<string, unknown>;
   serverId: string;
-  serverName?: string; // 追加
+  serverName: string;
 }
 
 export interface ChatMessage {
   id: string;
   content: string;
   role: 'user' | 'assistant';
-  timestamp: Date;
-  tools?: any[];
-  toolCalls?: Array<{ 
-    name: string; 
-    parameters: any; 
-    output?: any;
-    error?: string;
-  }>;
+  timestamp: string | Date;
+  status?: MessageStatus;
+  toolCalls?: string[];
 }
 
 export interface ChatSession {
+  schemaVersion?: number;
   id: string;
   name: string;
   messages: ChatMessage[];
-  createdAt: Date;
-  updatedAt: Date;
+  createdAt: string | Date;
+  updatedAt: string | Date;
   autoApproveAll?: boolean;
-  responseId?: string; // Azure OpenAI Responses API用のID
+  stateEpoch?: number;
 }
 
-export interface AzureOpenAIConfig {
-  endpoint: string;
-  apiKey: string;
-  deployment: string;
-  apiVersion: string;
-}
-
-// Alias for backward compatibility
-export type AzureConfig = AzureOpenAIConfig & {
-  apiKey?: string;
-  apiVersion?: string;
-  system_prompt?: string;
+export interface ResponsesOptions {
   temperature?: number;
-  top_p?: number;
-  max_tokens?: number;
-  systemPrompt?: string;
   topP?: number;
-  maxTokens?: number;
-  apiType?: 'chat' | 'responses';
-  // New Responses API (GPT-5) parameters (UI friendly names)
-  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high';
-  verbosity?: 'none' | 'low' | 'medium' | 'high';
+  maxOutputTokens?: number;
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  reasoningSummary?: 'auto' | 'concise' | 'detailed';
+  verbosity?: 'low' | 'medium' | 'high';
+  store?: boolean;
+  parallelToolCalls?: boolean;
+  serviceTier?: 'auto' | 'default' | 'flex' | 'priority';
+  truncation?: 'auto' | 'disabled';
+  maxToolCalls?: number;
+  safetyIdentifier?: string;
+  promptCacheKey?: string;
+  metadata?: Record<string, string>;
+}
+
+export interface ChatCompletionsOptions {
+  temperature?: number;
+  topP?: number;
   maxCompletionTokens?: number;
-  // Backend compatibility keys (when reading from server)
-  reasoning_effort?: string;
-  max_completion_tokens?: number | string;
-};
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  verbosity?: 'low' | 'medium' | 'high';
+  stop?: string | string[];
+  seed?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  logprobs?: boolean;
+  topLogprobs?: number;
+  store?: boolean;
+  parallelToolCalls?: boolean;
+  serviceTier?: 'auto' | 'default' | 'flex' | 'priority';
+  safetyIdentifier?: string;
+  promptCacheKey?: string;
+  metadata?: Record<string, string>;
+}
+
+export type ClaudeThinking =
+  | { type: 'disabled' }
+  | { type: 'enabled'; budgetTokens: number }
+  | { type: 'adaptive' };
+
+export interface ClaudeMessagesOptions {
+  maxTokens: number;
+  temperature?: number;
+  topP?: number;
+  topK?: number;
+  stopSequences?: string[];
+  thinking?: ClaudeThinking;
+  effort?: 'low' | 'medium' | 'high' | 'max';
+  serviceTier?: 'auto' | 'standard_only';
+  parallelToolUse?: boolean;
+  metadataUserId?: string;
+}
+
+export type FoundryOptions = ResponsesOptions | ChatCompletionsOptions | ClaudeMessagesOptions;
+
+export interface FoundrySettings {
+  schemaVersion: 2;
+  endpointKind: EndpointKind;
+  endpoint: string;
+  model: string;
+  apiType: ApiType;
+  versionMode: VersionMode;
+  apiVersion?: string;
+  auth: {
+    type: AuthType;
+    apiKeyConfigured: boolean;
+  };
+  agentInstructions: string;
+  options: FoundryOptions;
+}
+
+export interface FoundrySettingsWrite {
+  schemaVersion: 2;
+  endpointKind: EndpointKind;
+  endpoint: string;
+  model: string;
+  apiType: ApiType;
+  versionMode: VersionMode;
+  apiVersion?: string;
+  auth: {
+    type: AuthType;
+    apiKey: {
+      action: SecretAction;
+      value?: string;
+    };
+  };
+  agentInstructions: string;
+  options: Record<string, unknown>;
+}
 
 export interface SelectedTool {
   id: string;
   name: string;
-  description: any;
-  parameters: any;
+  description: string;
+  parameters: Record<string, unknown>;
   serverId: string;
-  serverName?: string;
+  serverName: string;
 }
 
-export interface ApprovalRequest {
+export interface ChatEventBase {
+  requestId: string;
+  sessionId: string;
+  messageId: string;
+  epoch: number;
+  sequence: number;
+}
+
+export interface ChatStartedEvent extends ChatEventBase {
+  userMessageId: string;
+  stateReset: boolean;
+}
+
+export interface ChatDeltaEvent extends ChatEventBase {
+  delta: string;
+}
+
+export interface ChatToolStatusEvent extends ChatEventBase {
+  toolId?: string;
+  toolName?: string;
+  callId?: string;
+  status: 'requested' | 'completed' | 'error';
+  arguments?: unknown;
+  error?: string;
+}
+
+export interface ApprovalRequestItem {
   id: string;
-  toolName: string;
   name: string;
-  arguments: any;
-  parameters: any;
-  description: string;
-  serverId: string;
-  server_label: string;
+  arguments: unknown;
+  serverLabel?: string;
 }
 
-export interface ToolApprovalRequest {
-  id: string;
-  toolName: string;
-  parameters: any;
-  description: string;
-  serverId: string;
+export interface ChatApprovalRequiredEvent extends ChatEventBase {
+  requests: ApprovalRequestItem[];
 }
 
+export interface ChatTerminalEvent extends ChatEventBase {
+  content: string;
+  toolCalls?: string[];
+  session?: ChatSession;
+  code?: string;
+  message?: string;
+}

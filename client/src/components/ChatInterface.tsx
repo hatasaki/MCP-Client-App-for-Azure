@@ -1,53 +1,67 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Alert,
+  Avatar,
   Box,
-  Paper,
-  TextField,
   Button,
-  Typography,
+  Checkbox,
+  CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  FormControlLabel,
+  FormGroup,
+  IconButton,
   List,
   ListItem,
-  Avatar,
-  IconButton,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  FormGroup,
-  FormControlLabel,
-  Checkbox,
-  Alert,
-  CircularProgress,
+  Paper,
+  TextField,
+  Tooltip,
+  Typography,
 } from '@mui/material';
-import SendIcon from '@mui/icons-material/Send';
-import PersonIcon from '@mui/icons-material/Person';
-import SmartToyIcon from '@mui/icons-material/SmartToy';
 import BuildIcon from '@mui/icons-material/Build';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
-import Tooltip from '@mui/material/Tooltip';
-import { Socket } from 'socket.io-client';
-import MarkdownRenderer from './MarkdownRenderer';
+import PersonIcon from '@mui/icons-material/Person';
+import SendIcon from '@mui/icons-material/Send';
+import SmartToyIcon from '@mui/icons-material/SmartToy';
 import StopIcon from '@mui/icons-material/Stop';
+import { Socket } from 'socket.io-client';
 
-import { ChatSession, ChatMessage, MCPTool, AzureConfig, SelectedTool, ApprovalRequest } from '../types';
-
-// Helper function to check for effectively missing Azure config
-const isChatInterfaceAzureConfigEffectivelyMissing = (config: AzureConfig | null): boolean => {
-  if (!config) return true;
-  return !config.endpoint || !config.deployment; // API key might be handled by server/env
-};
+import MarkdownRenderer from './MarkdownRenderer';
+import {
+  ChatApprovalRequiredEvent,
+  ChatDeltaEvent,
+  ChatMessage,
+  ChatSession,
+  ChatStartedEvent,
+  ChatTerminalEvent,
+  ChatToolStatusEvent,
+  MCPTool,
+  SelectedTool,
+} from '../types';
 
 interface ChatInterfaceProps {
   session: ChatSession;
   availableTools: MCPTool[];
-  azureConfig: AzureConfig | null;
+  settingsConfigured: boolean;
   socket: Socket | null;
 }
+
+interface LiveMessage {
+  messageId: string;
+  content: string;
+}
+
+const makeRequestId = () =>
+  typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 const ChatInterface: React.FC<ChatInterfaceProps> = ({
   session,
   availableTools,
-  azureConfig,
+  settingsConfigured,
   socket,
 }) => {
   const [message, setMessage] = useState('');
@@ -55,556 +69,360 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const [showToolSelector, setShowToolSelector] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [approvalRequest, setApprovalRequest] = useState<{
-    sessionId: string;
-    approvalRequest: ApprovalRequest;
-    responseId: string;
-  } | null>(null);
-  const [pendingApproval,setPendingApproval]=useState<any|null>(null);
-  const [pendingToolNames, setPendingToolNames] = useState<string[]>([]);
-  // Track "always approve" preference per session instead of a single global flag
-  // key = session.id, value = whether tool calls should be auto-approved for that session
-  const [alwaysApproveSessions, setAlwaysApproveSessions] = useState<Record<string, boolean>>({});
-
-  // Derived flag: whether to auto-approve tool calls for current session
-  const alwaysApprove = alwaysApproveSessions[session.id] || session.autoApproveAll || false;
-
+  const [liveMessage, setLiveMessage] = useState<LiveMessage | null>(null);
+  const [toolStatuses, setToolStatuses] = useState<ChatToolStatusEvent[]>([]);
+  const [approvalBatch, setApprovalBatch] = useState<ChatApprovalRequiredEvent | null>(null);
+  const [approvalDecisions, setApprovalDecisions] = useState<Record<string, boolean>>({});
+  const activeRequestRef = useRef<string | null>(null);
+  const lastSequenceRef = useRef(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-
-  const configIsEffectivelyMissing = isChatInterfaceAzureConfigEffectivelyMissing(azureConfig);
 
   useEffect(() => {
     if (!socket) return;
 
-    socket.on('messageResponse', (data: any) => {
-      setIsLoading(false);
-      setPendingToolNames([]);
-    });
-
-    const toolStartedHandler = (data: { sessionId: string; toolName: string }) => {
-      if (data.sessionId !== session.id) return;
-      setPendingToolNames(prev => [...prev, data.toolName]);
+    const accepts = (
+      event: { sessionId?: string; requestId?: string; sequence?: number },
+      terminal = false,
+    ) => {
+      if (event.sessionId && event.sessionId !== session.id) return false;
+      if (event.requestId && event.requestId !== activeRequestRef.current) return false;
+      if (event.sequence !== undefined) {
+        if (!terminal && event.sequence <= lastSequenceRef.current) return false;
+        lastSequenceRef.current = Math.max(lastSequenceRef.current, event.sequence);
+      }
+      return true;
     };
-    socket.on('toolStarted', toolStartedHandler);
 
-    const handler = (req: any) => {
-      if (alwaysApprove) {
-        socket.emit('approvalResult', { id: req.id, approved: true, approveAll: true });
-      } else {
-        setPendingApproval(req);
+    const started = (event: ChatStartedEvent) => {
+      if (!accepts(event)) return;
+      activeRequestRef.current = event.requestId;
+      setLiveMessage({ messageId: event.messageId, content: '' });
+      setIsLoading(true);
+      if (event.stateReset) {
+        setErrorMessage('Agent state was rebuilt. Completed text history was replayed under the current settings.');
       }
     };
-    socket.on('approvalRequired', handler);
-
-    socket.on('error', (error: { message: string }) => {
-      setIsLoading(false);
-      console.error('[ChatInterface] Received error:', error);
-      setErrorMessage(error.message);
-      // 5秒後にエラーメッセージを自動で非表示にする
-      setTimeout(() => setErrorMessage(null), 5000);
-    });
-
-    return () => {
-      socket.off('messageResponse');
-      socket.off('approvalRequired', handler);
-      socket.off('error');
-      socket.off('toolStarted', toolStartedHandler);
+    const delta = (event: ChatDeltaEvent) => {
+      if (!accepts(event)) return;
+      setLiveMessage((current) => ({
+        messageId: event.messageId,
+        content: `${current?.messageId === event.messageId ? current.content : ''}${event.delta}`,
+      }));
     };
-  }, [socket, alwaysApprove, session.id]);
+    const toolStatus = (event: ChatToolStatusEvent) => {
+      if (!accepts(event)) return;
+      setToolStatuses((current) => {
+        const key = event.callId || event.toolId || `${event.sequence}`;
+        const index = current.findIndex((item) => (item.callId || item.toolId || `${item.sequence}`) === key);
+        if (index < 0) return [...current, event];
+        return current.map((item, itemIndex) => itemIndex === index ? { ...item, ...event } : item);
+      });
+    };
+    const approval = (event: ChatApprovalRequiredEvent) => {
+      if (!accepts(event)) return;
+      setApprovalBatch(event);
+      setApprovalDecisions(Object.fromEntries(event.requests.map((request) => [request.id, false])));
+    };
+    const terminal = (event: ChatTerminalEvent) => {
+      if (!accepts(event, true)) return;
+      setLiveMessage({ messageId: event.messageId, content: event.content || '' });
+      setIsLoading(false);
+      setApprovalBatch(null);
+      setToolStatuses([]);
+      if (event.message) setErrorMessage(event.message);
+      activeRequestRef.current = null;
+    };
+
+    socket.on('chat:started', started);
+    socket.on('chat:delta', delta);
+    socket.on('chat:tool-status', toolStatus);
+    socket.on('chat:approval-required', approval);
+    socket.on('chat:completed', terminal);
+    socket.on('chat:cancelled', terminal);
+    socket.on('chat:error', terminal);
+    return () => {
+      socket.off('chat:started', started);
+      socket.off('chat:delta', delta);
+      socket.off('chat:tool-status', toolStatus);
+      socket.off('chat:approval-required', approval);
+      socket.off('chat:completed', terminal);
+      socket.off('chat:cancelled', terminal);
+      socket.off('chat:error', terminal);
+    };
+  }, [socket, session.id]);
 
   useEffect(() => {
-    scrollToBottom();
-  }, [session.messages]);
+    const persisted = liveMessage
+      ? session.messages.find((item) => item.id === liveMessage.messageId)
+      : undefined;
+    if (persisted && persisted.status !== 'streaming' && persisted.content === liveMessage?.content) {
+      setLiveMessage(null);
+    }
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [session.messages, liveMessage]);
 
-  // Remove selected tools that disappear from availableTools (e.g., server removed)
   useEffect(() => {
-    setSelectedTools(prev => prev.filter(sel =>
-      availableTools.some(av => av.serverId === sel.serverId && av.name === sel.name)
+    activeRequestRef.current = null;
+    lastSequenceRef.current = 0;
+    setIsLoading(false);
+    setLiveMessage(null);
+    setToolStatuses([]);
+    setApprovalBatch(null);
+    setApprovalDecisions({});
+  }, [session.id]);
+
+  useEffect(() => {
+    setSelectedTools((current) => current.filter((selected) =>
+      availableTools.some((tool) => tool.qualifiedId === selected.id)
     ));
   }, [availableTools]);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  const displayedMessages = useMemo(() => session.messages.map((item) =>
+    liveMessage?.messageId === item.id ? { ...item, content: liveMessage.content } : item
+  ), [session.messages, liveMessage]);
 
-  const handleSendMessage = () => {
-    if (configIsEffectivelyMissing) {
-      console.warn('[ChatInterface] handleSendMessage: Azure config is effectively missing. Message not sent.');
-      // Optionally, show an alert to the user here if not already visible
-      return;
-    }
-    if (!message.trim() || !socket || !azureConfig) { // azureConfig check here is now a bit redundant but harmless
-        console.warn('[ChatInterface] handleSendMessage: Basic send conditions not met (message, socket, or azureConfig).');
-        return;
-    }
+  const groupedTools = useMemo(() => availableTools.reduce((groups, tool) => {
+    (groups[tool.serverId] ||= []).push(tool);
+    return groups;
+  }, {} as Record<string, MCPTool[]>), [availableTools]);
 
+  const sendMessage = () => {
+    if (!socket || !settingsConfigured || !message.trim() || isLoading) return;
+    const requestId = makeRequestId();
+    activeRequestRef.current = requestId;
+    lastSequenceRef.current = 0;
     setIsLoading(true);
-    setErrorMessage(null); // エラーメッセージをクリア
-    socket.emit('sendMessage', {
+    setErrorMessage(null);
+    setLiveMessage(null);
+    setToolStatuses([]);
+    socket.emit('chat:send', {
+      requestId,
       sessionId: session.id,
       message: message.trim(),
-      selectedTools,
-      azureConfig,
+      selectedToolIds: selectedTools.map((tool) => tool.id),
     });
-
     setMessage('');
   };
 
-  const handleKeyPress = (event: React.KeyboardEvent) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
-      event.preventDefault();
-      handleSendMessage();
-    }
+  const cancel = () => {
+    if (!socket || !activeRequestRef.current) return;
+    socket.emit('chat:cancel', {
+      requestId: activeRequestRef.current,
+      sessionId: session.id,
+    });
   };
 
-  const handleToolSelection = (tool: MCPTool, selected: boolean) => {
-    if (selected) {
-      setSelectedTools(prev => [
-        ...prev,
-        {
-          id: `${tool.serverId}-${tool.name}`,
-          serverId: tool.serverId,
-          serverName: tool.serverName,    // 追加
+  const resolveApproval = (mode: 'submit' | 'deny' | 'always') => {
+    if (!socket || !approvalBatch) return;
+    const decisions = approvalBatch.requests.map((request) => ({
+      requestId: request.id,
+      approved: mode === 'always' || (mode === 'submit' && !!approvalDecisions[request.id]),
+    }));
+    socket.emit('chat:approval-resolve', {
+      requestId: approvalBatch.requestId,
+      sessionId: session.id,
+      decisions,
+      approveAll: mode === 'always',
+    });
+    setApprovalBatch(null);
+  };
+
+  const toggleTool = (tool: MCPTool, selected: boolean) => {
+    setSelectedTools((current) => selected
+      ? [...current, {
+          id: tool.qualifiedId,
           name: tool.name,
           description: tool.description,
           parameters: tool.parameters,
-        }
-      ]);
-    } else {
-      setSelectedTools(prev => 
-        prev.filter(t => !(t.serverId === tool.serverId && t.name === tool.name))
-      );
-    }
+          serverId: tool.serverId,
+          serverName: tool.serverName,
+        }]
+      : current.filter((item) => item.id !== tool.qualifiedId)
+    );
   };
 
-  const handleApproval = (approved: boolean, approveAll: boolean = false) => {
-    if (!approvalRequest || !socket) return;
-
-    socket.emit('approveToolCall', {
-      sessionId: approvalRequest.sessionId,
-      approvalRequestId: approvalRequest.approvalRequest.id,
-      approved,
-      approveAll,
-    });
-
-    if (approveAll) {
-      setAlwaysApproveSessions(prev => ({ ...prev, [session.id]: true }));
-    }
-    setApprovalRequest(null);
-    setIsLoading(true);
+  const toggleServer = (serverId: string, tools: MCPTool[]) => {
+    const allSelected = tools.every((tool) => selectedTools.some((selected) => selected.id === tool.qualifiedId));
+    setSelectedTools((current) => allSelected
+      ? current.filter((item) => item.serverId !== serverId)
+      : [
+          ...current.filter((item) => item.serverId !== serverId),
+          ...tools.map((tool) => ({
+            id: tool.qualifiedId,
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+            serverId: tool.serverId,
+            serverName: tool.serverName,
+          })),
+        ]
+    );
   };
 
-  const sendApproval = (approved: boolean, approveAll: boolean = false) => {
-    if (!socket || !pendingApproval) return;
-    if (approveAll) {
-      setAlwaysApproveSessions(prev => ({ ...prev, [session.id]: true }));
-    }
-    socket.emit('approvalResult', { id: pendingApproval.id, approved, approveAll });
-    setPendingApproval(null);
-  };
-
-  const handleStopGeneration = () => {
-    if (!socket) return;
-    socket.emit('stopGeneration', { sessionId: session.id });
-    setIsLoading(false);
-    setPendingToolNames([]);
-  };
-
-  const formatTimestamp = (timestamp: Date) => {
-    return new Date(timestamp).toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  };
-
-  const groupedTools = availableTools.reduce((acc, tool) => {
-    if (!acc[tool.serverId]) {
-      acc[tool.serverId] = [];
-    }
-    acc[tool.serverId].push(tool);
-    return acc;
-  }, {} as Record<string, MCPTool[]>);
-
-  // Calculate check state at MCP server level
-  const getServerCheckState = (serverId: string, tools: MCPTool[]) => {
-    const selectedServerTools = selectedTools.filter(t => t.serverId === serverId);
-    const allServerTools = tools;
-    
-    if (selectedServerTools.length === 0) {
-      return 'unchecked'; // nothing selected
-    } else if (selectedServerTools.length === allServerTools.length) {
-      return 'checked'; // all selected
-    } else {
-      return 'indeterminate'; // partially selected
-    }
-  };
-
-  // Toggle selection for entire MCP server
-  const handleServerSelection = (serverId: string, tools: MCPTool[]) => {
-    const checkState = getServerCheckState(serverId, tools);
-    
-    if (checkState === 'unchecked' || checkState === 'indeterminate') {
-      // If not or partially selected, select all tools
-      const newSelectedTools = tools.map(tool => ({
-        id: `${tool.serverId}-${tool.name}`,
-        serverId: tool.serverId,
-        serverName: tool.serverName,
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.parameters,
-      }));
-      
-      setSelectedTools(prev => [
-        ...prev.filter(t => t.serverId !== serverId), // remove existing tools from same server
-        ...newSelectedTools // add new tools
-      ]);
-    } else {
-      // If all selected, clear all selections
-      setSelectedTools(prev => prev.filter(t => t.serverId !== serverId));
-    }
-  };
+  const formatTimestamp = (timestamp: string | Date) => new Date(timestamp).toLocaleTimeString('en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 
   return (
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-      {/* Header */}
       <Box sx={{ p: 2, borderBottom: 1, borderColor: 'divider' }}>
-        <Typography variant="h6" gutterBottom>
-          {session.name}
-        </Typography>
-        
-
-
+        <Typography variant="h6">{session.name}</Typography>
         <Button
           variant="outlined"
           startIcon={<BuildIcon />}
           onClick={() => setShowToolSelector(true)}
-          sx={{ mt: 1 }}
           size="small"
-          disabled={configIsEffectivelyMissing} // Disable if config missing
+          sx={{ mt: 1 }}
+          disabled={!settingsConfigured}
         >
-          {availableTools.length > 0 
-            ? `Select tools (${selectedTools.length} selected / ${availableTools.length} available)` 
-            : 'Select tools (none available)'
-          }
+          Select tools ({selectedTools.length}/{availableTools.length})
         </Button>
-
-        {availableTools.length === 0 && !configIsEffectivelyMissing && (
-          <Alert severity="info" sx={{ mt: 1 }}>
-            No tools could be retrieved from the connected MCP servers.
-          </Alert>
-        )}
-
-        {configIsEffectivelyMissing && (
-          <Alert severity="warning" sx={{ mt: 1 }}>
-            Azure OpenAI configuration is incomplete. Please review the main Azure settings.
-          </Alert>
-        )}
-
-        {errorMessage && (
-          <Alert 
-            severity="error" 
-            sx={{ mt: 1 }}
-            onClose={() => setErrorMessage(null)}
-          >
-            {errorMessage}
-          </Alert>
-        )}
+        {session.autoApproveAll && <Alert severity="warning" sx={{ mt: 1 }}>This session automatically approves tool calls.</Alert>}
+        {!availableTools.length && <Alert severity="info" sx={{ mt: 1 }}>No MCP tools are currently available.</Alert>}
+        {errorMessage && <Alert severity="info" onClose={() => setErrorMessage(null)} sx={{ mt: 1 }}>{errorMessage}</Alert>}
       </Box>
 
-      {/* Messages */}
       <Box sx={{ flexGrow: 1, overflow: 'auto', p: 2 }}>
         <List>
-          {(session.messages as any[]).filter(m=>m.role!=='function').map((msg: ChatMessage, index: number) => (
-            <ListItem
-              key={index}
-              sx={{
-                display: 'flex',
-                justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
-                mb: 1,
-              }}
-            >              <Box
-                sx={{
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  maxWidth: '95%',
-                  width: '100%',
-                  flexDirection: msg.role === 'user' ? 'row-reverse' : 'row',
-                }}
-              >
-                <Avatar
-                  sx={{
-                    bgcolor: msg.role === 'user' ? 'primary.main' : 'secondary.main',
-                    mx: 1,
-                    flexShrink: 0,
-                  }}
-                >
-                  {msg.role === 'user' ? <PersonIcon /> : <SmartToyIcon />}
+          {displayedMessages.map((item: ChatMessage) => (
+            <ListItem key={item.id} sx={{ justifyContent: item.role === 'user' ? 'flex-end' : 'flex-start', mb: 1 }}>
+              <Box sx={{ display: 'flex', flexDirection: item.role === 'user' ? 'row-reverse' : 'row', width: '100%', alignItems: 'flex-start' }}>
+                <Avatar sx={{ bgcolor: item.role === 'user' ? 'primary.main' : 'secondary.main', mx: 1 }}>
+                  {item.role === 'user' ? <PersonIcon /> : <SmartToyIcon />}
                 </Avatar>
-                  <Paper
-                  sx={{
-                    p: 2,
-                    bgcolor: msg.role === 'user' ? 'primary.main' : 'grey.100',
-                    color: msg.role === 'user' ? 'white' : 'inherit',
-                    maxWidth: 'calc(100% - 56px)',
-                    width: 'fit-content',
-                    minWidth: 0,
-                    overflow: 'hidden',
-                    wordWrap: 'break-word',
-                    overflowWrap: 'break-word',
-                    boxSizing: 'border-box',
-                    userSelect: 'text', // Allow selecting and copying message text
-                    // 追加の制限でコンテンツが幅を超えないように
-                    '& *': {
-                      maxWidth: '100%',
-                      boxSizing: 'border-box',
-                      userSelect: 'text', // Ensure descendants are selectable
-                    }
-                  }}
-                >
-                  <MarkdownRenderer 
-                    content={msg.content} 
-                    color={msg.role === 'user' ? 'white' : 'inherit'}
-                  />
-                  
-                  {msg.toolCalls && msg.toolCalls.length > 0 && (
-                    <Typography variant="caption" color="text.secondary">
-                      tools: {msg.toolCalls.join(', ')}
-                    </Typography>
-                  )}
-                  
-                  <Typography
-                    variant="caption"
-                    sx={{
-                      display: 'block',
-                      mt: 1,
-                      opacity: 0.7,
-                    }}
-                  >
-                    {formatTimestamp(msg.timestamp)}
+                <Paper sx={{ p: 2, maxWidth: 'calc(100% - 56px)', bgcolor: item.role === 'user' ? 'primary.main' : 'grey.100', color: item.role === 'user' ? 'white' : 'inherit', overflowWrap: 'anywhere', userSelect: 'text' }}>
+                  {item.content ? <MarkdownRenderer content={item.content} color={item.role === 'user' ? 'white' : 'inherit'} /> : item.status === 'streaming' ? <CircularProgress size={18} /> : null}
+                  {!!item.toolCalls?.length && <Typography variant="caption" display="block">Tools: {item.toolCalls.join(', ')}</Typography>}
+                  <Typography variant="caption" display="block" sx={{ opacity: 0.7, mt: 1 }}>
+                    {formatTimestamp(item.timestamp)}{item.status && item.status !== 'completed' ? ` · ${item.status}` : ''}
                   </Typography>
                 </Paper>
               </Box>
             </ListItem>
           ))}
-          
-          {isLoading && (
-            <ListItem sx={{ justifyContent: 'center' }}>
-              <CircularProgress size={24} />
-              <Typography variant="body2" sx={{ ml: 1 }}>
-                Generating response...
+          {toolStatuses.map((status) => (
+            <ListItem key={status.callId || status.toolId || status.sequence} sx={{ justifyContent: 'center' }}>
+              <Typography variant="body2" color={status.status === 'error' ? 'error' : 'text.secondary'}>
+                {status.toolName || status.toolId || 'Tool'}: {status.status}
               </Typography>
             </ListItem>
-          )}
-          
-          {/* Pending tool names while awaiting assistant response */}
-          {pendingToolNames.length > 0 && (
-            <ListItem
-              sx={{
-                display: 'flex',
-                justifyContent: 'flex-start',
-                mb: 1,
-              }}
-            >
-              <Box
-                sx={{
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  maxWidth: '70%',
-                  width: '100%',
-                }}
-              >
-                <Avatar sx={{ bgcolor: 'secondary.main', mx: 1, flexShrink: 0 }}>
-                  <SmartToyIcon />
-                </Avatar>
-                <Paper sx={{ p: 2, bgcolor: 'grey.100', maxWidth: 'calc(100% - 56px)', width: 'fit-content' }}>
-                  {pendingToolNames.map((t, idx) => (
-                    <Typography key={idx} variant="body2" color="text.secondary">
-                      Tool: {t}
-                    </Typography>
-                  ))}
-                </Paper>
-              </Box>
-            </ListItem>
-          )}
-
+          ))}
           <div ref={messagesEndRef} />
         </List>
       </Box>
 
-      {/* Input Area */}
-      <Paper sx={{ p: 2, mt: 'auto', backgroundColor: 'background.default' }}>
+      <Paper sx={{ p: 2, mt: 'auto', bgcolor: 'background.default' }}>
         <Box sx={{ display: 'flex', alignItems: 'center' }}>
           <TextField
             fullWidth
-            variant="outlined"
-            placeholder="Type a message (Shift+Enter for newline)"
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            onKeyPress={handleKeyPress}
             multiline
             maxRows={5}
-            disabled={configIsEffectivelyMissing || isLoading} // Disable if config missing or loading
+            value={message}
+            disabled={!settingsConfigured || isLoading}
+            placeholder="Type a message (Shift+Enter for newline)"
+            onChange={(event) => setMessage(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+              }
+            }}
           />
-          <IconButton
-            color="secondary"
-            onClick={handleStopGeneration}
-            disabled={!isLoading}
-            sx={{ ml: 1 }}
-          >
+          <IconButton aria-label="Stop generation" color="secondary" onClick={cancel} disabled={!isLoading} sx={{ ml: 1 }}>
             <StopIcon />
           </IconButton>
-          <IconButton
-            color="primary"
-            onClick={handleSendMessage}
-            disabled={!message.trim() || configIsEffectivelyMissing || isLoading} // Disable if config missing or loading
-            sx={{ ml: 1 }}
-          >
+          <IconButton aria-label="Send message" color="primary" onClick={sendMessage} disabled={!message.trim() || !settingsConfigured || isLoading} sx={{ ml: 1 }}>
             {isLoading ? <CircularProgress size={24} /> : <SendIcon />}
           </IconButton>
         </Box>
       </Paper>
 
-      {/* Tool Selector Dialog */}
-      <Dialog
-        open={showToolSelector}
-        onClose={() => setShowToolSelector(false)}
-        maxWidth="md"
-        fullWidth
-      >
+      <Dialog open={showToolSelector} onClose={() => setShowToolSelector(false)} maxWidth="md" fullWidth>
         <DialogTitle>Select MCP Tools</DialogTitle>
         <DialogContent>
-          {Object.keys(groupedTools).length === 0 ? (
-            <Typography>No tools available</Typography>
-          ) : (
-            Object.entries(groupedTools).map(([serverId, tools]) => {
-              // serverName があれば使い、なければ serverId をフォールバック
-              const displayName = tools[0]?.serverName || serverId;
-              const checkState = getServerCheckState(serverId, tools);
-              
-              return (
-                <Box key={serverId} sx={{ mb: 3 }}>
-                  <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
+          {Object.entries(groupedTools).map(([serverId, tools]) => {
+            const selectedCount = tools.filter((tool) => selectedTools.some((selected) => selected.id === tool.qualifiedId)).length;
+            return (
+              <Box key={serverId} sx={{ mb: 3 }}>
+                <FormControlLabel
+                  control={
                     <Checkbox
-                      checked={checkState === 'checked'}
-                      indeterminate={checkState === 'indeterminate'}
-                      onChange={() => handleServerSelection(serverId, tools)}
-                      sx={{ mr: 1 }}
+                      checked={selectedCount === tools.length}
+                      indeterminate={selectedCount > 0 && selectedCount < tools.length}
+                      onChange={() => toggleServer(serverId, tools)}
                     />
-                    <Typography variant="h6" gutterBottom sx={{ mb: 0 }}>
-                      {displayName}
-                    </Typography>
-                  </Box>
-                  <FormGroup sx={{ ml: 4 }}>
-                    {tools.map((tool) => (
-                      <FormControlLabel
-                        key={`${tool.serverId}-${tool.name}`}
-                        control={
-                          <Checkbox
-                            checked={selectedTools.some(
-                              t => t.serverId === tool.serverId && t.name === tool.name
-                            )}
-                            onChange={(e) => handleToolSelection(tool, e.target.checked)}
-                          />
-                        }
-                        label={
-                          <Box>
-                            <Box sx={{ display: 'flex', alignItems: 'center' }}>
-                              <Typography variant="body1" sx={{ mr: 1 }}>
-                                {tool.name}
-                              </Typography>
-                              <Tooltip title="Copy tool name">
-                                <IconButton
-                                  size="small"
-                                  onClick={(e) => {
-                                    e.stopPropagation(); // Prevent checkbox toggle
-                                    navigator.clipboard.writeText(tool.name);
-                                  }}
-                                >
-                                  <ContentCopyIcon fontSize="small" />
-                                </IconButton>
-                              </Tooltip>
-                            </Box>
-                            {tool.description && (
-                              <Typography variant="body2" color="text.secondary">
-                                {tool.description}
-                              </Typography>
-                            )}
+                  }
+                  label={<Typography variant="h6">{tools[0]?.serverName || serverId}</Typography>}
+                />
+                <FormGroup sx={{ ml: 4 }}>
+                  {tools.map((tool) => (
+                    <FormControlLabel
+                      key={tool.qualifiedId}
+                      control={
+                        <Checkbox
+                          checked={selectedTools.some((selected) => selected.id === tool.qualifiedId)}
+                          onChange={(event) => toggleTool(tool, event.target.checked)}
+                        />
+                      }
+                      label={
+                        <Box>
+                          <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                            <Typography>{tool.displayName}</Typography>
+                            <Tooltip title="Copy qualified tool ID">
+                              <IconButton
+                                size="small"
+                                aria-label={`Copy qualified ID for ${tool.displayName}`}
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  navigator.clipboard.writeText(tool.qualifiedId);
+                                }}
+                              >
+                                <ContentCopyIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
                           </Box>
-                        }
-                      />
-                    ))}
-                  </FormGroup>
-                </Box>
-              );
-            })
-          )}
+                          <Typography variant="body2" color="text.secondary">{tool.description}</Typography>
+                        </Box>
+                      }
+                    />
+                  ))}
+                </FormGroup>
+              </Box>
+            );
+          })}
+          {!availableTools.length && <Typography>No tools available.</Typography>}
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setShowToolSelector(false)}>Close</Button>
-        </DialogActions>
+        <DialogActions><Button onClick={() => setShowToolSelector(false)}>Close</Button></DialogActions>
       </Dialog>
 
-      {/* Approval Dialog */}
-      <Dialog
-        open={!!approvalRequest}
-        onClose={() => {}} // Prevent closing without decision
-        maxWidth="sm"
-        fullWidth
-      >
+      <Dialog open={!!approvalBatch} onClose={() => undefined} maxWidth="sm" fullWidth>
         <DialogTitle>Tool Execution Approval</DialogTitle>
         <DialogContent>
-          {approvalRequest && (
-            <Box>
-              <Typography variant="body1" gutterBottom>
-                Do you allow the execution of the following tool?
-              </Typography>
-              <Typography variant="h6" gutterBottom>
-                {approvalRequest.approvalRequest.name}
-              </Typography>
-              <Typography variant="body2" color="text.secondary" gutterBottom>
-                Server: {approvalRequest.approvalRequest.server_label}
-              </Typography>
-              <Typography variant="body2" gutterBottom>
-                Arguments:
-              </Typography>
-              <Paper sx={{ p: 2, bgcolor: 'grey.100' }}>
-                <pre style={{ margin: 0, fontSize: '0.875rem' }}>
-                  {JSON.stringify(approvalRequest.approvalRequest.arguments, null, 2)}
-                </pre>
-              </Paper>
-            </Box>
-          )}
+          <Typography sx={{ mb: 2 }}>Review every requested tool call. Unchecked calls are denied.</Typography>
+          {approvalBatch?.requests.map((request) => (
+            <Paper key={request.id} variant="outlined" sx={{ p: 2, mb: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={!!approvalDecisions[request.id]}
+                    onChange={(event) => setApprovalDecisions((current) => ({ ...current, [request.id]: event.target.checked }))}
+                  />
+                }
+                label={request.name}
+              />
+              {request.serverLabel && <Typography variant="body2">Server: {request.serverLabel}</Typography>}
+              <pre style={{ overflow: 'auto', margin: 0 }}>{JSON.stringify(request.arguments, null, 2)}</pre>
+            </Paper>
+          ))}
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => handleApproval(false)} color="error">
-            Deny
-          </Button>
-          <Button onClick={() => handleApproval(true, true)} color="warning">
-            Always Allow
-          </Button>
-          <Button onClick={() => handleApproval(true)} color="primary" variant="contained">
-            Execute
-          </Button>
+          <Button color="error" onClick={() => resolveApproval('deny')}>Deny all</Button>
+          <Button onClick={() => resolveApproval('submit')}>Submit decisions</Button>
+          <Button variant="contained" color="warning" onClick={() => resolveApproval('always')}>Always allow all</Button>
         </DialogActions>
       </Dialog>
-
-      {/* Pending Approval Dialog */}
-      {pendingApproval && (
-        <Dialog open onClose={()=>sendApproval(false)}>
-          <DialogTitle>Confirm Tool Execution</DialogTitle>
-          <DialogContent>
-            <Typography>Tool: {pendingApproval.name}</Typography>
-            <pre style={{background:'#eee',padding:8,borderRadius:4,maxHeight:200,overflow:'auto'}}> 
-{JSON.stringify(pendingApproval.arguments,null,2)}
-</pre>
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={()=>sendApproval(false)}>Deny</Button>
-            <Button onClick={()=>sendApproval(true,false)} color="warning">Allow</Button>
-            <Button onClick={()=>sendApproval(true,true)} color="error">Always Allow</Button>
-          </DialogActions>
-        </Dialog>
-      )}
     </Box>
   );
 };

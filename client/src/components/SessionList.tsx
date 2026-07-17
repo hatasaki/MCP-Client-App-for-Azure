@@ -27,7 +27,7 @@ const SessionList: React.FC<SessionListProps> = ({
   onSelectSession,
   onDeleteSession, // destructure delete callback
 }) => {
-  const formatDate = (date: Date) => {
+  const formatDate = (date: string | Date) => {
     const now = new Date();
     const sessionDate = new Date(date);
     const isToday = now.toDateString() === sessionDate.toDateString();

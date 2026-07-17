@@ -1,6 +1,6 @@
-# React Front-End
+# Microsoft Foundry React Frontend
 
-This folder contains the Material-UI React UI for *MCP Client for Azure*.
+This folder contains the Material UI frontend for *MCP Client for Microsoft Foundry*. It uses server-canonical Foundry settings, Socket.IO token streaming, batched MCP approval, and real run cancellation.
 
 ## Scripts
 
@@ -8,6 +8,6 @@ This folder contains the Material-UI React UI for *MCP Client for Azure*.
 |---------|---------|
 | `npm start` | Start dev server on <http://localhost:3000> |
 | `npm run build` | Create production build in `build/` |
-| `npm test` | Run unit tests with Jest |
+| `npm test -- --watchAll=false` | Run unit tests once with Jest |
 
-The project was bootstrapped with **Create React App** and uses **TypeScript**.
+Use `npm ci --legacy-peer-deps` for a clean install. The project was bootstrapped with Create React App and uses TypeScript. API keys are never persisted in browser storage.

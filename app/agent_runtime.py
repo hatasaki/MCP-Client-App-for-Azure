@@ -1,0 +1,479 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+from uuid import uuid4
+
+from agent_framework import Agent, AgentSession, Content, Message
+
+from app.foundry_config import FoundrySettings
+from app.mcp_manager import MCPManager
+from app.provider_factory import ProviderFactory
+from app.session_manager import SessionManager
+
+EventSink = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+class AgentRuntimeError(RuntimeError):
+    pass
+
+
+class AgentRunBusyError(AgentRuntimeError):
+    pass
+
+
+class ApprovalNotFoundError(AgentRuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalDecision:
+    request_id: str
+    approved: bool
+
+
+@dataclass(slots=True)
+class PendingApproval:
+    run_request_id: str
+    session_id: str
+    requests: list[Content]
+    future: asyncio.Future[tuple[dict[str, bool], bool]]
+
+
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    request_id: str
+    session_id: str
+    message_id: str
+    content: str
+    status: str
+    tool_calls: tuple[str, ...]
+
+
+class AgentRuntime:
+    """Coordinates MAF Agent streaming, approvals, sessions, and cancellation."""
+
+    def __init__(
+        self,
+        session_manager: SessionManager,
+        mcp_manager: MCPManager,
+        *,
+        provider_factory: ProviderFactory | None = None,
+    ) -> None:
+        self.session_manager = session_manager
+        self.mcp_manager = mcp_manager
+        self.provider_factory = provider_factory or ProviderFactory()
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._active_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._active_request_ids: dict[str, str] = {}
+        self._pending_approvals: dict[str, PendingApproval] = {}
+        self._registry_lock = asyncio.Lock()
+
+    async def run(
+        self,
+        *,
+        session_id: str,
+        message: str,
+        selected_tool_ids: Sequence[str],
+        settings: FoundrySettings,
+        emit: EventSink,
+        request_id: str | None = None,
+    ) -> RunResult:
+        if not message.strip():
+            raise ValueError("Message must not be empty.")
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked():
+            raise AgentRunBusyError(f"Session '{session_id}' already has an active run.")
+
+        run_request_id = request_id or str(uuid4())
+        task = asyncio.current_task()
+        if task is None:
+            raise AgentRuntimeError("Agent runtime requires an asyncio task.")
+
+        async with lock:
+            async with self._registry_lock:
+                self._active_tasks[session_id] = task
+                self._active_request_ids[session_id] = run_request_id
+            try:
+                return await self._run_locked(
+                    session_id=session_id,
+                    message=message.strip(),
+                    selected_tool_ids=selected_tool_ids,
+                    settings=settings,
+                    emit=emit,
+                    request_id=run_request_id,
+                )
+            finally:
+                self._cancel_pending_approval(run_request_id)
+                async with self._registry_lock:
+                    if self._active_tasks.get(session_id) is task:
+                        self._active_tasks.pop(session_id, None)
+                        self._active_request_ids.pop(session_id, None)
+
+    async def _run_locked(
+        self,
+        *,
+        session_id: str,
+        message: str,
+        selected_tool_ids: Sequence[str],
+        settings: FoundrySettings,
+        emit: EventSink,
+        request_id: str,
+    ) -> RunResult:
+        # Validate user-controlled tool IDs before mutating persisted session state.
+        selected_functions = self.mcp_manager.get_functions(selected_tool_ids)
+        forced_qualified_id, clean_message = self._extract_forced_tool(message, selected_tool_ids)
+        options = settings.to_maf_options()
+        configured_tool_choice = options.get("tool_choice")
+        if forced_qualified_id is not None:
+            forced_function = self.mcp_manager.get_function(forced_qualified_id)
+            options["tool_choice"] = {
+                "mode": "required",
+                "required_function_name": forced_function.name,
+            }
+
+        fingerprint = settings.fingerprint()
+        agent_session, replay, state_reset = self.session_manager.prepare_agent_session(session_id, fingerprint)
+        user_message = self.session_manager.append_message(
+            session_id,
+            role="user",
+            content=message,
+            status="completed",
+        )
+        assistant_message_id = str(uuid4())
+        self.session_manager.append_message(
+            session_id,
+            role="assistant",
+            content="",
+            status="streaming",
+            message_id=assistant_message_id,
+        )
+        internal_session = self.session_manager.get_session(session_id)
+        epoch = int(internal_session.get("stateEpoch", 0)) if internal_session else 0
+        sequence = 0
+
+        async def send(event: str, payload: Mapping[str, Any] | None = None) -> None:
+            nonlocal sequence
+            sequence += 1
+            body = {
+                "requestId": request_id,
+                "sessionId": session_id,
+                "messageId": assistant_message_id,
+                "epoch": epoch,
+                "sequence": sequence,
+            }
+            if payload:
+                body.update(payload)
+            await emit(event, body)
+
+        await send("chat:started", {
+            "userMessageId": user_message["id"],
+            "stateReset": state_reset,
+        })
+
+        current_input: str | list[Message]
+        current_message = Message(role="user", contents=[clean_message])
+        current_input = [*replay, current_message] if replay else clean_message
+
+        content_parts: list[str] = []
+        executed_tools: list[str] = []
+        tool_calls_by_call_id: dict[str, str] = {}
+        try:
+            bundle = self.provider_factory.create(settings)
+            agent = Agent(
+                client=bundle.client,
+                name="MCPClientAgent",
+                instructions=settings.agent_instructions,
+                tools=selected_functions,
+                default_options=options,
+            )
+            async with bundle, agent:
+                while True:
+                    requests_by_id: dict[str, Content] = {}
+                    stream = agent.run(current_input, stream=True, session=agent_session)
+                    async for update in stream:
+                        if update.text:
+                            content_parts.append(update.text)
+                            await send("chat:delta", {"delta": update.text})
+                        for content in update.contents:
+                            await self._handle_tool_content(
+                                content,
+                                executed_tools,
+                                tool_calls_by_call_id,
+                                send,
+                            )
+                        if update.user_input_requests:
+                            for request in update.user_input_requests:
+                                requests_by_id.setdefault(request.id or str(id(request)), request)
+                    # Ensure MAF result hooks run and session state/conversation id are finalized.
+                    await stream.get_final_response()
+                    requests = list(requests_by_id.values())
+                    if not requests:
+                        break
+                    decisions, approve_all = await self._request_approval(
+                        run_request_id=request_id,
+                        session_id=session_id,
+                        requests=requests,
+                        auto_approve=bool(internal_session and internal_session.get("autoApproveAll")),
+                        send=send,
+                    )
+                    if approve_all and internal_session is not None:
+                        self.session_manager.update_session(session_id, {"autoApproveAll": True})
+                        internal_session = self.session_manager.get_session(session_id)
+                    responses = [
+                        request.to_function_approval_response(
+                            approved=decisions.get(request.id or "", False)
+                        )
+                        for request in requests
+                    ]
+                    current_input = [Message(role="user", contents=responses)]
+                    # A forced tool applies to the first model call only.
+                    if forced_qualified_id is not None:
+                        if configured_tool_choice is None:
+                            agent.default_options.pop("tool_choice", None)
+                        else:
+                            agent.default_options["tool_choice"] = configured_tool_choice
+                        forced_qualified_id = None
+
+            final_content = "".join(content_parts)
+            self.session_manager.update_message(
+                session_id,
+                assistant_message_id,
+                content=final_content,
+                status="completed",
+                toolCalls=executed_tools,
+            )
+            self.session_manager.save_agent_session(session_id, agent_session, fingerprint)
+            await send("chat:completed", {
+                "content": final_content,
+                "toolCalls": executed_tools,
+                "session": self.session_manager.get_public_session(session_id),
+            })
+            return RunResult(
+                request_id=request_id,
+                session_id=session_id,
+                message_id=assistant_message_id,
+                content=final_content,
+                status="completed",
+                tool_calls=tuple(executed_tools),
+            )
+        except asyncio.CancelledError:
+            partial = "".join(content_parts)
+            self.session_manager.update_message(
+                session_id,
+                assistant_message_id,
+                content=partial,
+                status="cancelled",
+                toolCalls=executed_tools,
+            )
+            self.session_manager.rollback_agent_session(session_id)
+            await asyncio.shield(send("chat:cancelled", {
+                "content": partial,
+                "toolCalls": executed_tools,
+                "session": self.session_manager.get_public_session(session_id),
+            }))
+            raise
+        except Exception as exc:
+            partial = "".join(content_parts)
+            self.session_manager.update_message(
+                session_id,
+                assistant_message_id,
+                content=partial,
+                status="error",
+                toolCalls=executed_tools,
+            )
+            self.session_manager.rollback_agent_session(session_id)
+            await send("chat:error", {
+                "code": type(exc).__name__,
+                "message": self._safe_error_message(exc, settings.api_key),
+                "content": partial,
+                "session": self.session_manager.get_public_session(session_id),
+            })
+            raise
+
+    async def _handle_tool_content(
+        self,
+        content: Content,
+        executed_tools: list[str],
+        tool_calls_by_call_id: dict[str, str],
+        send: Callable[[str, Mapping[str, Any] | None], Awaitable[None]],
+    ) -> None:
+        if content.type == "function_call":
+            model_name = content.name or ""
+            definition = self.mcp_manager.tool_definition_for_model_name(model_name)
+            qualified_id = definition["qualifiedId"] if definition else model_name
+            if content.call_id:
+                tool_calls_by_call_id[content.call_id] = qualified_id
+            await send("chat:tool-status", {
+                "toolId": qualified_id,
+                "toolName": definition["displayName"] if definition else model_name,
+                "callId": content.call_id,
+                "status": "requested",
+                "arguments": self._safe_json(content.arguments),
+            })
+        elif content.type == "function_result":
+            # Function result content carries only call_id. The qualified tool is
+            # captured from the preceding function call status; report completion by call.
+            qualified_id = tool_calls_by_call_id.get(content.call_id or "")
+            if qualified_id and qualified_id not in executed_tools and content.exception is None:
+                executed_tools.append(qualified_id)
+            await send("chat:tool-status", {
+                "toolId": qualified_id,
+                "callId": content.call_id,
+                "status": "completed" if content.exception is None else "error",
+                "error": str(content.exception) if content.exception else None,
+            })
+        elif content.type == "mcp_server_tool_call":
+            model_name = content.tool_name or ""
+            definition = self.mcp_manager.tool_definition_for_model_name(model_name)
+            qualified_id = definition["qualifiedId"] if definition else model_name
+            if qualified_id and qualified_id not in executed_tools:
+                executed_tools.append(qualified_id)
+        elif content.type == "mcp_server_tool_result" and content.call_id:
+            await send("chat:tool-status", {"callId": content.call_id, "status": "completed"})
+
+    async def _request_approval(
+        self,
+        *,
+        run_request_id: str,
+        session_id: str,
+        requests: list[Content],
+        auto_approve: bool,
+        send: Callable[[str, Mapping[str, Any] | None], Awaitable[None]],
+    ) -> tuple[dict[str, bool], bool]:
+        for request in requests:
+            if not request.id:
+                request.id = str(uuid4())
+        if auto_approve:
+            return {request.id: True for request in requests if request.id}, True
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[dict[str, bool], bool]] = loop.create_future()
+        pending = PendingApproval(run_request_id, session_id, requests, future)
+        self._pending_approvals[run_request_id] = pending
+        await send("chat:approval-required", {
+            "requests": [self._approval_payload(request) for request in requests],
+        })
+        try:
+            return await future
+        finally:
+            if self._pending_approvals.get(run_request_id) is pending:
+                self._pending_approvals.pop(run_request_id, None)
+
+    def resolve_approval(
+        self,
+        run_request_id: str,
+        decisions: Sequence[Mapping[str, Any]],
+        *,
+        approve_all: bool = False,
+    ) -> None:
+        pending = self._pending_approvals.get(run_request_id)
+        if pending is None or pending.future.done():
+            raise ApprovalNotFoundError(f"No pending approval for request '{run_request_id}'.")
+        allowed_ids = {request.id or "" for request in pending.requests}
+        resolved: dict[str, bool] = {}
+        for item in decisions:
+            if not isinstance(item, Mapping):
+                raise ValueError("Every approval decision must be an object.")
+            request_id = item.get("requestId")
+            approved = item.get("approved")
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError("Every approval decision requires a non-empty requestId.")
+            if not isinstance(approved, bool):
+                raise ValueError(f"Approval decision '{request_id}' requires a boolean approved value.")
+            if request_id in resolved:
+                raise ValueError(f"Duplicate approval decision for request '{request_id}'.")
+            resolved[request_id] = approved
+        unknown = set(resolved) - allowed_ids
+        if unknown:
+            raise ValueError(f"Unknown approval request ids: {sorted(unknown)}")
+        for request_id in allowed_ids:
+            resolved.setdefault(request_id, False)
+        pending.future.set_result((resolved, approve_all))
+
+    async def cancel(self, session_id: str, request_id: str | None = None) -> bool:
+        task = self._active_tasks.get(session_id)
+        active_request_id = self._active_request_ids.get(session_id)
+        if task is None or task.done():
+            return False
+        if request_id is not None and request_id != active_request_id:
+            return False
+        if active_request_id:
+            self._cancel_pending_approval(active_request_id)
+        task.cancel()
+        return True
+
+    async def shutdown(self) -> None:
+        tasks = [task for task in self._active_tasks.values() if not task.done()]
+        for run_request_id in list(self._pending_approvals):
+            self._cancel_pending_approval(run_request_id)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _cancel_pending_approval(self, run_request_id: str) -> None:
+        pending = self._pending_approvals.pop(run_request_id, None)
+        if pending and not pending.future.done():
+            pending.future.cancel()
+
+    @staticmethod
+    def _approval_payload(request: Content) -> dict[str, Any]:
+        call = request.function_call
+        return {
+            "id": request.id,
+            "name": call.name if call else "",
+            "arguments": AgentRuntime._safe_json(call.arguments if call else None),
+            "serverLabel": (
+                (call.additional_properties or {}).get("server_label") if call else None
+            ),
+        }
+
+    @staticmethod
+    def _safe_json(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value
+
+    @staticmethod
+    def _safe_error_message(exc: Exception, api_key: str | None = None) -> str:
+        message = str(exc)
+        if api_key:
+            message = message.replace(api_key, "[REDACTED]")
+        message = re.sub(
+            r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
+            r"\1[REDACTED]",
+            message,
+        )
+        message = re.sub(
+            r"(?i)(api[-_ ]?key\s*[:=]\s*)[^\s,;]+",
+            r"\1[REDACTED]",
+            message,
+        )
+        return message[:1000]
+
+    @staticmethod
+    def _extract_forced_tool(message: str, selected_tool_ids: Sequence[str]) -> tuple[str | None, str]:
+        if not message.startswith("#"):
+            return None, message
+        token, separator, remainder = message[1:].partition(" ")
+        if token in selected_tool_ids:
+            clean = remainder.lstrip() if separator else ""
+            return token, clean or "Use the selected tool."
+        return None, message
+
+
+__all__ = [
+    "AgentRunBusyError",
+    "AgentRuntime",
+    "AgentRuntimeError",
+    "ApprovalDecision",
+    "ApprovalNotFoundError",
+    "RunResult",
+]
