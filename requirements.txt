@@ -12,5 +12,5 @@ agent-framework-foundry==1.10.1
 agent-framework-anthropic==1.0.0b260709
 openai==2.46.0
 # agent-framework-anthropic 1.0.0b260709 requires anthropic <0.117.0.
-anthropic==0.116.0
+anthropic==0.117.0
 mcp==1.28.1
