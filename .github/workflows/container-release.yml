@@ -124,6 +124,8 @@ jobs:
 
       - name: Show summary
         run: |
-          echo "Images pushed:" >> "$GITHUB_STEP_SUMMARY"
-          echo "- ghcr.io/${{ steps.repo.outputs.repo }}:${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- ghcr.io/${{ steps.repo.outputs.repo }}:latest" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Images pushed:"
+            echo "- ghcr.io/${{ steps.repo.outputs.repo }}:${{ steps.version.outputs.version }}"
+            echo "- ghcr.io/${{ steps.repo.outputs.repo }}:latest"
+          } >> "$GITHUB_STEP_SUMMARY"
