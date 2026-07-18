@@ -41,6 +41,15 @@ Claude support uses the beta MAF Anthropic connector. Its `max_tokens` setting i
 
 On macOS, an unsigned downloaded app might require **System Settings → Privacy & Security → Open Anyway**.
 
+If macOS still blocks the app, remove the quarantine attribute from this app only, then launch it. The following example assumes that `mcpclient.app` was copied to `/Applications`:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/mcpclient.app"
+open "/Applications/mcpclient.app"
+```
+
+Replace the path if the app is stored elsewhere. Run this only after verifying that the archive was downloaded from this repository's GitHub Releases page. Do not disable Gatekeeper globally, and do not use `sudo` unless the app's file permissions specifically require it.
+
 Windows desktop builds use the current pywebview WebView2 backend. Windows 10/11 normally includes the Microsoft Edge WebView2 Runtime; install or repair that runtime if the application window cannot be created.
 
 ## Configure Microsoft Foundry
