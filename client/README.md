@@ -1,6 +1,6 @@
 # Microsoft Foundry React Frontend
 
-This folder contains the Material UI frontend for *MCP Client for Microsoft Foundry*. It uses server-canonical schema v3 Foundry settings, API-specific model profiles, a persistent per-chat model selector, Socket.IO token streaming, batched MCP approval, and real run cancellation.
+This folder contains the Material UI frontend for *MCP Client for Microsoft Foundry*. It uses server-canonical schema v4 Foundry settings, API-specific model profiles with one chat default model, a persistent per-chat model selector, Socket.IO token streaming, batched MCP approval, and real run cancellation.
 
 ## Scripts
 

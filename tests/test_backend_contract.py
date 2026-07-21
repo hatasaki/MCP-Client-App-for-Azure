@@ -16,14 +16,13 @@ from app.secret_protection import SecretProtectionError
 
 def project_settings() -> FoundrySettings:
     return FoundrySettings.model_validate({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "project",
         "endpoint": "https://example.services.ai.azure.com/api/projects/demo",
         "auth": {"type": "entra_id"},
         "apiProfiles": [{
             "apiType": "responses",
             "models": ["deployment", "deployment-secondary"],
-            "defaultModel": "deployment",
             "versionMode": "v1",
             "options": {},
         }],
@@ -33,7 +32,7 @@ def project_settings() -> FoundrySettings:
 
 def project_write_payload() -> dict[str, Any]:
     return {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "project",
         "endpoint": "https://example.services.ai.azure.com/api/projects/demo",
         "auth": {"type": "entra_id", "apiKey": {"action": "clear"}},
@@ -41,7 +40,6 @@ def project_write_payload() -> dict[str, Any]:
         "apiProfiles": [{
             "apiType": "responses",
             "models": ["deployment", "deployment-secondary"],
-            "defaultModel": "deployment",
             "versionMode": "v1",
             "options": {"store": False},
         }],
@@ -65,7 +63,7 @@ def test_foundry_settings_rest_contract_and_secret_redaction(monkeypatch):
         assert client.get("/healthz").json() == {"status": "ok"}
         assert client.get("/foundry-settings/status").json() == {
             "isConfigured": False,
-            "schemaVersion": 3,
+            "schemaVersion": 4,
         }
         assert client.get("/foundry-settings").status_code == 404
 
@@ -132,14 +130,13 @@ def test_secret_protection_failure_returns_recoverable_service_error(monkeypatch
 
 def test_startup_decryption_failure_exposes_only_recoverable_non_secret_settings(monkeypatch):
     recoverable = FoundrySettings.model_validate({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "model",
         "endpoint": "https://example.services.ai.azure.com",
         "auth": {"type": "api_key", "apiKey": "placeholder-only"},
         "apiProfiles": [{
             "apiType": "responses",
             "models": ["deployment", "deployment-secondary"],
-            "defaultModel": "deployment",
             "versionMode": "v1",
             "options": {},
         }],
@@ -461,7 +458,6 @@ async def test_new_session_is_reserved_before_session_created_event_allows_setti
     runtime = ReservationRuntime()
     removal = project_write_payload()
     removal["apiProfiles"][0]["models"] = ["deployment"]
-    removal["apiProfiles"][0]["defaultModel"] = "deployment"
     removal["defaultSelection"] = {"apiType": "responses", "model": "deployment"}
 
     async def capture(event: str, payload: dict[str, Any], room: str | None = None, **_kwargs: Any):

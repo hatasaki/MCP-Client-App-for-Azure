@@ -27,7 +27,7 @@ def settings(
 ) -> FoundrySettings:
     deployments = models or ["deployment"]
     return FoundrySettings.model_validate({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "model",
         "endpoint": "https://example.openai.azure.com",
         "auth": {"type": "api_key", "apiKey": "secret"},
@@ -35,7 +35,6 @@ def settings(
         "apiProfiles": [{
             "apiType": "responses",
             "models": deployments,
-            "defaultModel": deployments[0],
             "versionMode": "v1",
             "options": {"store": False},
         }],

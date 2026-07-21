@@ -88,14 +88,13 @@ def test_claude_route_contract():
 
 def test_resolved_non_default_model_controls_dated_deployment_route():
     settings = FoundrySettings.model_validate({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "model",
         "endpoint": "https://demo.services.ai.azure.com",
         "auth": {"type": "entra_id"},
         "apiProfiles": [{
             "apiType": "chat_completions",
             "models": ["default-deployment", "selected-deployment"],
-            "defaultModel": "default-deployment",
             "versionMode": "dated",
             "apiVersion": "2025-04-01-preview",
             "options": {},

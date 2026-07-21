@@ -33,7 +33,6 @@ def protector(key: bytes = b"k" * 32) -> SecretProtector:
 def responses_profile(
     models: list[str] | None = None,
     *,
-    default: str | None = None,
     version_mode: str = "v1",
     api_version: str | None = None,
     options: dict[str, Any] | None = None,
@@ -42,7 +41,6 @@ def responses_profile(
     return {
         "apiType": "responses",
         "models": deployments,
-        "defaultModel": default or deployments[0],
         "versionMode": version_mode,
         **({"apiVersion": api_version} if api_version is not None else {}),
         "options": options or {},
@@ -52,7 +50,6 @@ def responses_profile(
 def chat_profile(
     models: list[str] | None = None,
     *,
-    default: str | None = None,
     version_mode: str = "v1",
     api_version: str | None = None,
     options: dict[str, Any] | None = None,
@@ -61,7 +58,6 @@ def chat_profile(
     return {
         "apiType": "chat_completions",
         "models": deployments,
-        "defaultModel": default or deployments[0],
         "versionMode": version_mode,
         **({"apiVersion": api_version} if api_version is not None else {}),
         "options": options or {},
@@ -71,14 +67,12 @@ def chat_profile(
 def claude_profile(
     models: list[str] | None = None,
     *,
-    default: str | None = None,
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     deployments = models or ["claude-deployment"]
     return {
         "apiType": "claude_messages",
         "models": deployments,
-        "defaultModel": default or deployments[0],
         "versionMode": "provider",
         "options": options if options is not None else {"maxTokens": 2048},
     }
@@ -86,12 +80,12 @@ def claude_profile(
 
 def project_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "project",
         "endpoint": "https://example.services.ai.azure.com/api/projects/demo/",
         "auth": {"type": "entra_id"},
         "agentInstructions": "Project instructions",
-        "apiProfiles": [responses_profile(["gpt-primary", "gpt-secondary"], default="gpt-primary")],
+        "apiProfiles": [responses_profile(["gpt-primary", "gpt-secondary"])],
         "defaultSelection": {"apiType": "responses", "model": "gpt-primary"},
     }
     payload.update(overrides)
@@ -107,7 +101,7 @@ def model_payload(
     configured = profiles or [responses_profile()]
     first = configured[0]
     return {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "model",
         "endpoint": "https://example.services.ai.azure.com",
         "auth": auth or {"type": "entra_id"},
@@ -115,7 +109,7 @@ def model_payload(
         "apiProfiles": configured,
         "defaultSelection": default_selection or {
             "apiType": first["apiType"],
-            "model": first["defaultModel"],
+            "model": first["models"][0],
         },
     }
 
@@ -147,7 +141,7 @@ def test_project_settings_are_normalized_multi_model_and_redacted():
         "type": "entra_id",
         "apiKeyConfigured": False,
     }
-    assert settings.public_dict()["schemaVersion"] == 3
+    assert settings.public_dict()["schemaVersion"] == 4
 
 
 def test_project_rejects_api_key_before_network_io():
@@ -237,10 +231,9 @@ def test_claude_requires_max_tokens_and_maps_options():
 
 def test_profiles_keep_api_specific_models_versions_and_options_isolated():
     profiles = [
-        responses_profile(["shared", "reasoner"], default="reasoner", options={"temperature": 0}),
+        responses_profile(["shared", "reasoner"], options={"temperature": 0}),
         chat_profile(
             ["shared", "chat-fast"],
-            default="chat-fast",
             version_mode="dated",
             api_version="2025-04-01-preview",
             options={"temperature": 1.25, "maxCompletionTokens": 256},
@@ -341,7 +334,6 @@ def test_encrypted_key_is_bound_to_all_non_secret_settings(tmp_path: Path, mutat
         payload["endpoint"] = "https://attacker.example"
     elif mutation == "profile":
         payload["apiProfiles"][0]["models"] = ["substituted-model"]
-        payload["apiProfiles"][0]["defaultModel"] = "substituted-model"
         payload["defaultSelection"]["model"] = "substituted-model"
     elif mutation == "instructions":
         payload["agentInstructions"] = "tampered"
@@ -353,7 +345,7 @@ def test_encrypted_key_is_bound_to_all_non_secret_settings(tmp_path: Path, mutat
         store.load()
 
 
-def test_v2_plaintext_config_is_atomically_rewritten_as_encrypted_v3(tmp_path: Path):
+def test_v2_plaintext_config_is_atomically_rewritten_as_encrypted_v4(tmp_path: Path):
     target = tmp_path / "FoundrySettings.json"
     legacy = tmp_path / "AzureOpenAI.json"
     backup = legacy.with_suffix(legacy.suffix + ".pre-foundry.bak")
@@ -379,12 +371,59 @@ def test_v2_plaintext_config_is_atomically_rewritten_as_encrypted_v3(tmp_path: P
 
     assert migrated is not None and migrated.api_key == "v2-plaintext-key"
     assert migrated.default_selection.model == "v2-deployment"
-    assert persisted["schemaVersion"] == 3
+    assert persisted["schemaVersion"] == 4
+    assert "defaultModel" not in persisted["apiProfiles"][0]
     assert persisted["auth"]["apiKeyEncrypted"]["algorithm"] == "AES-256-GCM"
     assert "v2-plaintext-key" not in persisted_text
     assert not legacy.exists()
     assert not backup.exists()
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_unreleased_v3_settings_format_is_intentionally_unsupported(tmp_path: Path):
+    path = tmp_path / "FoundrySettings.json"
+    v3_payload: dict[str, Any] = {
+        "schemaVersion": 3,
+        "endpointKind": "model",
+        "endpoint": "https://example.services.ai.azure.com",
+        "agentInstructions": "v3 instructions",
+        "apiProfiles": [
+            {
+                "apiType": "responses",
+                "models": ["shared", "reasoner"],
+                "defaultModel": "reasoner",
+                "versionMode": "v1",
+                "options": {"store": False},
+            },
+            {
+                "apiType": "chat_completions",
+                "models": ["shared", "chat-fast"],
+                "defaultModel": "chat-fast",
+                "versionMode": "v1",
+                "options": {},
+            },
+        ],
+        "defaultSelection": {"apiType": "chat_completions", "model": "shared"},
+        "credentialRevision": 0,
+        "auth": {"type": "entra_id"},
+    }
+    path.write_text(json.dumps(v3_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unsupported Foundry settings schemaVersion: 3"):
+        FoundrySettingsStore(path, protector=protector()).load()
+    assert json.loads(path.read_text(encoding="utf-8")) == v3_payload
+
+    with pytest.raises(ValidationError):
+        FoundrySettings.model_validate({
+            "schemaVersion": 3,
+            "endpointKind": "model",
+            "endpoint": "https://example.services.ai.azure.com",
+            "model": "v3-single-shape",
+            "apiType": "responses",
+            "versionMode": "v1",
+            "auth": {"type": "entra_id"},
+            "options": {},
+        })
 
 
 def test_legacy_azure_config_migrates_encrypted_without_plaintext_backup(tmp_path: Path):
@@ -445,7 +484,7 @@ def test_legacy_plaintext_deletion_failure_is_not_silently_ignored(tmp_path: Pat
     assert legacy.exists()
 
 
-def test_schema_v3_rejects_plaintext_api_key_field(tmp_path: Path):
+def test_schema_v4_rejects_plaintext_api_key_field(tmp_path: Path):
     path = tmp_path / "FoundrySettings.json"
     payload = model_payload(auth={"type": "api_key", "apiKey": "plaintext"})
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -456,7 +495,7 @@ def test_schema_v3_rejects_plaintext_api_key_field(tmp_path: Path):
 
 def test_corrupt_storage_requires_explicit_full_replacement(tmp_path: Path):
     path = tmp_path / "FoundrySettings.json"
-    path.write_text('{"schemaVersion":3,"auth":', encoding="utf-8")
+    path.write_text('{"schemaVersion":4,"auth":', encoding="utf-8")
     store = FoundrySettingsStore(path, protector=protector())
 
     with pytest.raises(SecretProtectionError, match="invalid or corrupted"):
@@ -523,7 +562,7 @@ def test_v2_shape_is_accepted_for_in_memory_compatibility():
         "options": {},
     })
 
-    assert settings.schema_version == 3
+    assert settings.schema_version == 4
     assert settings.default_selection.model == "legacy-shape"
 
 

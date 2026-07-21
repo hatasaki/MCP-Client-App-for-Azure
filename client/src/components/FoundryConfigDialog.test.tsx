@@ -8,7 +8,7 @@ const renderDialog = () => render(
 );
 
 const multiProfileSettings: FoundrySettings = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   endpointKind: 'model',
   endpoint: 'https://example.services.ai.azure.com',
   auth: { type: 'entra_id', apiKeyConfigured: false },
@@ -17,14 +17,12 @@ const multiProfileSettings: FoundrySettings = {
     {
       apiType: 'responses',
       models: ['shared', 'reasoner'],
-      defaultModel: 'reasoner',
       versionMode: 'v1',
       options: { temperature: 0.25, store: false },
     },
     {
       apiType: 'chat_completions',
       models: ['shared', 'chat-fast'],
-      defaultModel: 'chat-fast',
       versionMode: 'dated',
       apiVersion: '2025-04-01-preview',
       options: { temperature: 1.25, maxCompletionTokens: 256 },
@@ -32,7 +30,6 @@ const multiProfileSettings: FoundrySettings = {
     {
       apiType: 'claude_messages',
       models: ['shared'],
-      defaultModel: 'shared',
       versionMode: 'provider',
       options: { maxTokens: 1024, temperature: 0.4 },
     },
@@ -61,6 +58,25 @@ test('model endpoint enables API and authentication selection', () => {
   expect(screen.queryByText(/Project endpoints use Entra ID/i)).not.toBeInTheDocument();
   expect(screen.getByRole('combobox', { name: 'Authentication' })).not.toHaveAttribute('aria-disabled', 'true');
   expect(screen.getByRole('combobox', { name: 'API' })).not.toHaveAttribute('aria-disabled', 'true');
+});
+
+test('places endpoint authentication directly below the endpoint and exposes one chat default', () => {
+  render(
+    <FoundryConfigDialog
+      open
+      onClose={() => undefined}
+      onSave={() => undefined}
+      initialConfig={multiProfileSettings}
+    />
+  );
+
+  const endpoint = screen.getByRole('textbox', { name: /Model resource endpoint/ });
+  const authentication = screen.getByRole('combobox', { name: 'Authentication' });
+  const api = screen.getByRole('combobox', { name: 'API' });
+  expect(endpoint.compareDocumentPosition(authentication) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(authentication.compareDocumentPosition(api) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(screen.queryByRole('combobox', { name: 'Default model for this API' })).not.toBeInTheDocument();
+  expect(screen.getByRole('combobox', { name: 'Default model for chats' })).toHaveTextContent('reasoner · Responses');
 });
 
 test('Claude displays beta warning and required max tokens', () => {
@@ -104,11 +120,13 @@ test('switching API loads and preserves each persisted profile independently', a
   fireEvent.click(screen.getByRole('button', { name: 'Save' }));
   await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
   const saved = onSave.mock.calls[0][0];
-  expect(saved.schemaVersion).toBe(3);
+  expect(saved.schemaVersion).toBe(4);
   expect(saved.apiProfiles).toHaveLength(3);
   expect(saved.apiProfiles.find((profile: any) => profile.apiType === 'responses').options.temperature).toBe(0.5);
   expect(saved.apiProfiles.find((profile: any) => profile.apiType === 'chat_completions').options.temperature).toBe(1.5);
   expect(saved.apiProfiles.filter((profile: any) => profile.models.includes('shared'))).toHaveLength(3);
+  expect(saved.apiProfiles.every((profile: any) => profile.defaultModel === undefined)).toBe(true);
+  expect(saved.defaultSelection).toEqual({ apiType: 'responses', model: 'reasoner' });
 });
 
 test('switching a dated model profile to Project normalizes Responses to v1', async () => {
@@ -118,7 +136,6 @@ test('switching a dated model profile to Project normalizes Responses to v1', as
     apiProfiles: [{
       apiType: 'responses',
       models: ['response-model'],
-      defaultModel: 'response-model',
       versionMode: 'dated',
       apiVersion: '2025-04-01-preview',
       options: {},

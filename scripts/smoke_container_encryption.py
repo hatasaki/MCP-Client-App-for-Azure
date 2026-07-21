@@ -16,7 +16,7 @@ SMOKE_SECRET = "container-smoke-api-key"
 
 def settings() -> FoundrySettings:
     return FoundrySettings.model_validate({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "model",
         "endpoint": "https://smoke.services.ai.azure.com",
         "auth": {"type": "api_key", "apiKey": SMOKE_SECRET},
@@ -24,7 +24,6 @@ def settings() -> FoundrySettings:
         "apiProfiles": [{
             "apiType": "responses",
             "models": ["smoke-deployment"],
-            "defaultModel": "smoke-deployment",
             "versionMode": "v1",
             "options": {"store": False},
         }],

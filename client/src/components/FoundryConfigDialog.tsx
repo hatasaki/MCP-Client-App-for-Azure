@@ -62,7 +62,6 @@ interface CommonFormState {
 interface ProfileFormState {
   apiType: ApiType;
   modelRows: string[];
-  defaultModel: string;
   versionMode: VersionMode;
   apiVersion: string;
   options: Record<string, any>;
@@ -84,7 +83,6 @@ const defaultCommon = (): CommonFormState => ({
 const defaultProfile = (apiType: ApiType): ProfileFormState => ({
   apiType,
   modelRows: deploymentsToRows(),
-  defaultModel: '',
   versionMode: apiType === 'claude_messages' ? 'provider' : 'v1',
   apiVersion: '',
   options: apiType === 'claude_messages' ? { maxTokens: 4096 } : {},
@@ -113,7 +111,6 @@ const hydrateProfiles = (initial?: FoundrySettings | null): ProfileForms => Obje
     return [apiType, {
       apiType,
       modelRows: deploymentsToRows(persisted.models),
-      defaultModel: persisted.defaultModel,
       versionMode: persisted.versionMode,
       apiVersion: persisted.apiVersion || '',
       options,
@@ -168,7 +165,6 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
   }, [open, initialConfig]);
 
   const activeProfile = profiles[activeApiType];
-  const activeModels = rowsToDeployments(activeProfile.modelRows);
 
   const availableSelections = useMemo(() => API_TYPES.flatMap((apiType) => {
     if (common.endpointKind === 'project' && apiType !== 'responses') return [];
@@ -215,7 +211,13 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
       setActiveApiType('responses');
       const responseModels = rowsToDeployments(profiles.responses.modelRows);
       if (responseModels.length) {
-        setDefaultModelKey(selectionKey({ apiType: 'responses', model: profiles.responses.defaultModel || responseModels[0] }));
+        const currentDefault = defaultModelKey ? parseSelectionKey(defaultModelKey) : null;
+        const model = currentDefault?.apiType === 'responses' && responseModels.includes(currentDefault.model)
+          ? currentDefault.model
+          : responseModels[0];
+        setDefaultModelKey(selectionKey({ apiType: 'responses', model }));
+      } else {
+        setDefaultModelKey('');
       }
     }
   };
@@ -292,7 +294,6 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
         setFormError(`${apiType}: model deployment names must be unique.`);
         return;
       }
-      const defaultModel = models.includes(profile.defaultModel) ? profile.defaultModel : models[0];
       if (profile.versionMode === 'dated' && !profile.apiVersion.trim()) {
         setFormError(`${apiType}: a dated API version is required.`);
         return;
@@ -309,7 +310,6 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
       apiProfiles.push({
         apiType,
         models,
-        defaultModel,
         versionMode: profile.versionMode,
         ...(profile.versionMode === 'dated' ? { apiVersion: profile.apiVersion.trim() } : {}),
         options: prepareOptions(profile),
@@ -323,7 +323,7 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
       : selections[0];
 
     const payload: FoundrySettingsWrite = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       endpointKind: common.endpointKind,
       endpoint: common.endpoint.trim(),
       auth: {
@@ -408,6 +408,66 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
     </TextField>
   );
 
+  const authenticationSettings = (
+    <>
+      <FormControl fullWidth>
+        <InputLabel id="foundry-auth-label">Authentication</InputLabel>
+        <Select
+          id="foundry-auth"
+          labelId="foundry-auth-label"
+          label="Authentication"
+          value={common.authType}
+          disabled={common.endpointKind === 'project'}
+          onChange={(event) => changeAuthType(event.target.value as AuthType)}
+        >
+          <MenuItem value="entra_id">Microsoft Entra ID</MenuItem>
+          <MenuItem value="api_key">API key</MenuItem>
+        </Select>
+      </FormControl>
+
+      {common.authType === 'api_key' && (
+        <>
+          {initialConfig?.auth.apiKeyNeedsReplacement && (
+            <Alert severity="warning">
+              The encrypted API key cannot be read. Verify the endpoint and every model profile, then enter a
+              replacement key to retain the reviewed settings.
+            </Alert>
+          )}
+          <TextField
+            select
+            label="API key action"
+            value={common.secretAction}
+            onChange={(event) => {
+              const secretAction = event.target.value as SecretAction;
+              if (secretAction === 'clear') {
+                setCommon((current) => ({
+                  ...current,
+                  authType: 'entra_id',
+                  secretAction: 'clear',
+                  apiKeyValue: '',
+                }));
+              } else setCommonField('secretAction', secretAction);
+            }}
+          >
+            {common.apiKeyConfigured && <MenuItem value="keep">Keep configured key</MenuItem>}
+            <MenuItem value="set">{common.apiKeyConfigured ? 'Replace key' : 'Set key'}</MenuItem>
+            {common.apiKeyConfigured && <MenuItem value="clear">Clear key and use Entra ID</MenuItem>}
+          </TextField>
+          {common.secretAction === 'set' && (
+            <TextField
+              label="API key"
+              type="password"
+              value={common.apiKeyValue}
+              onChange={(event) => setCommonField('apiKeyValue', event.target.value)}
+              autoComplete="new-password"
+              required
+            />
+          )}
+        </>
+      )}
+    </>
+  );
+
   return (
     <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
       <DialogTitle>Microsoft Foundry Settings</DialogTitle>
@@ -452,6 +512,8 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
             required
           />
 
+          {authenticationSettings}
+
           <FormControl fullWidth>
             <InputLabel id="foundry-api-label">API</InputLabel>
             <Select
@@ -471,24 +533,8 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
           <Typography variant="subtitle1">Model deployments for {API_LABELS[activeApiType]}</Typography>
           <DeploymentRows
             rows={activeProfile.modelRows}
-            onChange={(modelRows) => {
-              const models = rowsToDeployments(modelRows);
-              updateActiveProfile({
-                modelRows,
-                defaultModel: models.includes(activeProfile.defaultModel) ? activeProfile.defaultModel : (models[0] || ''),
-              });
-            }}
+            onChange={(modelRows) => updateActiveProfile({ modelRows })}
           />
-          <TextField
-            select
-            label="Default model for this API"
-            value={activeModels.includes(activeProfile.defaultModel) ? activeProfile.defaultModel : (activeModels[0] || '')}
-            onChange={(event) => updateActiveProfile({ defaultModel: event.target.value })}
-            disabled={!activeModels.length}
-            helperText="Used when this API profile is selected as the default for a new chat."
-          >
-            {activeModels.map((model) => <MenuItem key={model} value={model}>{model}</MenuItem>)}
-          </TextField>
 
           {common.endpointKind === 'model' && activeApiType !== 'claude_messages' && (
             <TextField
@@ -592,7 +638,7 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
           <Divider />
           <TextField
             select
-            label="Default model for new chats"
+            label="Default model for chats"
             value={availableSelections.some((item) => selectionKey(item) === defaultModelKey)
               ? defaultModelKey
               : (availableSelections[0] ? selectionKey(availableSelections[0]) : '')}
@@ -605,62 +651,6 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
               </MenuItem>
             ))}
           </TextField>
-
-          <FormControl fullWidth>
-            <InputLabel id="foundry-auth-label">Authentication</InputLabel>
-            <Select
-              id="foundry-auth"
-              labelId="foundry-auth-label"
-              label="Authentication"
-              value={common.authType}
-              disabled={common.endpointKind === 'project'}
-              onChange={(event) => changeAuthType(event.target.value as AuthType)}
-            >
-              <MenuItem value="entra_id">Microsoft Entra ID</MenuItem>
-              <MenuItem value="api_key">API key</MenuItem>
-            </Select>
-          </FormControl>
-
-          {common.authType === 'api_key' && (
-            <>
-              {initialConfig?.auth.apiKeyNeedsReplacement && (
-                <Alert severity="warning">
-                  The encrypted API key cannot be read. Verify the endpoint and every model profile, then enter a
-                  replacement key to retain the reviewed settings.
-                </Alert>
-              )}
-              <TextField
-                select
-                label="API key action"
-                value={common.secretAction}
-                onChange={(event) => {
-                  const secretAction = event.target.value as SecretAction;
-                  if (secretAction === 'clear') {
-                    setCommon((current) => ({
-                      ...current,
-                      authType: 'entra_id',
-                      secretAction: 'clear',
-                      apiKeyValue: '',
-                    }));
-                  } else setCommonField('secretAction', secretAction);
-                }}
-              >
-                {common.apiKeyConfigured && <MenuItem value="keep">Keep configured key</MenuItem>}
-                <MenuItem value="set">{common.apiKeyConfigured ? 'Replace key' : 'Set key'}</MenuItem>
-                {common.apiKeyConfigured && <MenuItem value="clear">Clear key and use Entra ID</MenuItem>}
-              </TextField>
-              {common.secretAction === 'set' && (
-                <TextField
-                  label="API key"
-                  type="password"
-                  value={common.apiKeyValue}
-                  onChange={(event) => setCommonField('apiKeyValue', event.target.value)}
-                  autoComplete="new-password"
-                  required
-                />
-              )}
-            </>
-          )}
 
           <TextField
             label="Agent Instructions"

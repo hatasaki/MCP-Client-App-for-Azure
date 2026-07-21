@@ -11,14 +11,13 @@ from app.session_manager import SessionManager
 
 def multi_model_settings() -> FoundrySettings:
     return FoundrySettings.model_validate({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "model",
         "endpoint": "https://example.services.ai.azure.com",
         "auth": {"type": "entra_id"},
         "apiProfiles": [{
             "apiType": "responses",
             "models": ["primary", "secondary"],
-            "defaultModel": "primary",
             "versionMode": "v1",
             "options": {},
         }],

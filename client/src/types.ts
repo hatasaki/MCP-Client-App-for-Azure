@@ -114,7 +114,6 @@ export interface ModelSelection {
 
 interface ApiProfileBase {
   models: string[];
-  defaultModel: string;
   versionMode: VersionMode;
   apiVersion?: string;
 }
@@ -137,7 +136,7 @@ export interface ClaudeMessagesProfile extends ApiProfileBase {
 export type ApiProfile = ResponsesProfile | ChatCompletionsProfile | ClaudeMessagesProfile;
 
 export interface FoundrySettings {
-  schemaVersion: 3;
+  schemaVersion: 4;
   endpointKind: EndpointKind;
   endpoint: string;
   auth: {
@@ -151,7 +150,7 @@ export interface FoundrySettings {
 }
 
 export interface FoundrySettingsWrite {
-  schemaVersion: 3;
+  schemaVersion: 4;
   endpointKind: EndpointKind;
   endpoint: string;
   auth: {

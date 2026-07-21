@@ -21,7 +21,7 @@ def _enabled() -> bool:
 def _project_settings() -> FoundrySettings:
     model = os.environ["FOUNDRY_MODEL"]
     return FoundrySettings.model_validate({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "endpointKind": "project",
         "endpoint": os.environ["FOUNDRY_PROJECT_ENDPOINT"],
         "auth": {"type": "entra_id"},
@@ -29,7 +29,6 @@ def _project_settings() -> FoundrySettings:
         "apiProfiles": [{
             "apiType": "responses",
             "models": [model],
-            "defaultModel": model,
             "versionMode": "v1",
             "options": {"maxOutputTokens": 64, "store": False},
         }],

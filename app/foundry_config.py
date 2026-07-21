@@ -7,7 +7,7 @@ import re
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Literal, Mapping, Sequence
+from typing import Annotated, Any, Literal, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
@@ -23,7 +23,7 @@ from pydantic import (
 
 from app.secret_protection import SecretProtectionError, SecretProtector
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 DEFAULT_AGENT_INSTRUCTIONS = (
     "Based on the user's instructions, analyze the user's intent, define goals to achieve that intent, "
@@ -270,7 +270,6 @@ class ModelSelection(StrictModel):
 
 class ApiProfileBase(StrictModel):
     models: Annotated[list[str], Field(min_length=1)]
-    default_model: str
     version_mode: VersionMode
     api_version: str | None = None
 
@@ -282,12 +281,6 @@ class ApiProfileBase(StrictModel):
         if len(value) != len(set(value)):
             raise ValueError("Model deployment names must be unique within an API type.")
         return value
-
-    @model_validator(mode="after")
-    def validate_default_model(self) -> "ApiProfileBase":
-        if self.default_model not in self.models:
-            raise ValueError("defaultModel must reference a configured model deployment.")
-        return self
 
     def to_maf_options(self) -> dict[str, Any]:
         raise NotImplementedError
@@ -376,7 +369,6 @@ def _upgrade_v2_payload(data: Mapping[str, Any]) -> dict[str, Any]:
     mutable["apiProfiles"] = [{
         "apiType": api_type,
         "models": [model],
-        "defaultModel": model,
         "versionMode": version_mode,
         "apiVersion": api_version,
         "options": options,
@@ -397,8 +389,11 @@ class FoundrySettings(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def accept_v2_shape(cls, data: Any) -> Any:
+    def accept_legacy_shape(cls, data: Any) -> Any:
         if not isinstance(data, Mapping):
+            return data
+        explicit_version = data.get("schemaVersion", data.get("schema_version"))
+        if explicit_version is not None and int(explicit_version) != 2:
             return data
         if "apiProfiles" not in data and "api_profiles" not in data and ("model" in data):
             return _upgrade_v2_payload(data)
@@ -561,8 +556,11 @@ class FoundrySettingsWrite(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def accept_v2_shape(cls, data: Any) -> Any:
+    def accept_legacy_shape(cls, data: Any) -> Any:
         if not isinstance(data, Mapping):
+            return data
+        explicit_version = data.get("schemaVersion", data.get("schema_version"))
+        if explicit_version is not None and int(explicit_version) != 2:
             return data
         if "apiProfiles" not in data and "api_profiles" not in data and "model" in data:
             return _upgrade_v2_payload(data)
@@ -699,7 +697,6 @@ def migrate_legacy_config(data: Mapping[str, Any]) -> FoundrySettings | None:
         "apiProfiles": [{
             "apiType": api_type.value,
             "models": [model],
-            "defaultModel": model,
             "versionMode": version_mode.value,
             "apiVersion": api_version if version_mode == VersionMode.DATED else None,
             "options": options,
@@ -726,10 +723,12 @@ class FoundrySettingsStore:
             if not isinstance(data, Mapping):
                 raise ValueError("Foundry settings root must be a JSON object.")
             schema_version = int(data.get("schemaVersion", 2))
-            if schema_version < SCHEMA_VERSION:
+            if schema_version == 2:
                 settings = migrate_v2_config(data)
                 self.save(settings)
                 return settings
+            if schema_version != SCHEMA_VERSION:
+                raise ValueError(f"Unsupported Foundry settings schemaVersion: {schema_version}.")
             settings = FoundrySettings.model_validate(self._decrypt_storage_payload(data))
             self._remove_plaintext_legacy_files()
             return settings
@@ -793,7 +792,8 @@ class FoundrySettingsStore:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(data, Mapping):
             raise ValueError("Foundry settings root must be a JSON object.")
-        if int(data.get("schemaVersion", 0)) != SCHEMA_VERSION:
+        schema_version = int(data.get("schemaVersion", 0))
+        if schema_version != SCHEMA_VERSION:
             return None
         mutable = dict(data)
         auth = dict(mutable.get("auth") or {})
@@ -808,7 +808,7 @@ class FoundrySettingsStore:
         mutable = dict(data)
         auth = dict(mutable.get("auth") or {})
         if "apiKey" in auth:
-            raise ValueError("Schema v3 settings must not contain a plaintext apiKey.")
+            raise ValueError("Encrypted settings must not contain a plaintext apiKey.")
         encrypted = auth.pop("apiKeyEncrypted", None)
         if auth.get("type") == AuthType.API_KEY.value:
             if not isinstance(encrypted, Mapping):

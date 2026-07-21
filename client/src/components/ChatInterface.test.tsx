@@ -15,7 +15,7 @@ beforeAll(() => {
 });
 
 const settings: FoundrySettings = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   endpointKind: 'model',
   endpoint: 'https://example.services.ai.azure.com',
   auth: { type: 'entra_id', apiKeyConfigured: false },
@@ -24,14 +24,12 @@ const settings: FoundrySettings = {
     {
       apiType: 'responses',
       models: ['shared', 'reasoner'],
-      defaultModel: 'reasoner',
       versionMode: 'v1',
       options: {},
     },
     {
       apiType: 'chat_completions',
       models: ['shared'],
-      defaultModel: 'shared',
       versionMode: 'v1',
       options: {},
     },

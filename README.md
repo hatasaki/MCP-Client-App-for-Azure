@@ -61,17 +61,63 @@ Open **Foundry Settings**, then select the endpoint kind, API, version mode, aut
 - Project endpoints lock API to Responses, version to `v1`, and authentication to Entra ID.
 - Model endpoints permit API key or Entra ID.
 - Enter one or more deployment names. A blank trailing row appears automatically, and names must be unique within an API type.
-- Responses, Chat Completions, and Claude Messages each retain their own model list, default model, version settings, and typed options when switching API in the settings dialog. The same deployment name can be used by different API types.
-- Select the default deployment for each API profile and the global default used by new chats.
+- Responses, Chat Completions, and Claude Messages each retain their own model list, version settings, and typed options when switching API in the settings dialog. The same deployment name can be used by different API types.
+- Authentication belongs to the endpoint and appears directly below it. Model endpoints support API key or Entra ID; Project endpoints remain Entra ID-only.
+- Select one **Default model for chats** across all configured API profiles. API Type-specific default models are not stored.
 - API keys support explicit **keep**, **replace**, and **clear** behavior. They are AES-256-GCM encrypted at rest and are never returned by the REST settings API or stored in browser local storage.
 - Every Foundry endpoint must use HTTPS. For API-key authentication, authenticated encryption also binds the key to the persisted endpoint, profiles, instructions, authentication type, schema, and credential revision, so editing or transplanting those fields invalidates decryption.
 - Optional parameter fields are omitted when empty. Boolean `false`, numeric `0`, and reasoning effort `none` are sent explicitly.
 
 `DefaultAzureCredential` is used for Entra ID. A developer can normally authenticate with Azure CLI, environment/workload identity, managed identity, or interactive browser credentials supported by Azure Identity.
 
+### Settings file
+
+The logical `FoundrySettings.json` structure is:
+
+```json
+{
+  "schemaVersion": 4,
+  "endpointKind": "model",
+  "endpoint": "https://resource.services.ai.azure.com",
+  "auth": {
+    "type": "api_key",
+    "apiKeyEncrypted": {
+      "version": 1,
+      "algorithm": "AES-256-GCM",
+      "keyId": "...",
+      "nonce": "...",
+      "ciphertext": "..."
+    }
+  },
+  "agentInstructions": "...",
+  "apiProfiles": [
+    {
+      "apiType": "responses",
+      "models": ["gpt-primary", "gpt-secondary"],
+      "versionMode": "v1",
+      "options": { "store": false }
+    },
+    {
+      "apiType": "chat_completions",
+      "models": ["gpt-chat"],
+      "versionMode": "dated",
+      "apiVersion": "2025-04-01-preview",
+      "options": {}
+    }
+  ],
+  "defaultSelection": {
+    "apiType": "responses",
+    "model": "gpt-primary"
+  },
+  "credentialRevision": 1
+}
+```
+
+`auth` applies to the endpoint and all API profiles. `apiProfiles` do not contain `defaultModel`; `defaultSelection` is the only chat default. The REST API never returns `apiKeyEncrypted`, `credentialRevision`, or plaintext key material.
+
 ### Legacy migration
 
-Schema v2 `FoundrySettings.json` and a valid legacy `AzureOpenAI.json` are migrated to schema v3 on first load. Any plaintext API key is encrypted before the schema v3 file atomically replaces the old settings. The legacy source and an existing `AzureOpenAI.json.pre-foundry.bak` are then deleted; no plaintext backup is created.
+A valid legacy `AzureOpenAI.json` or single-profile `FoundrySettings.json` is migrated on first load. Legacy endpoint, deployment, API type/version, system prompt, generation parameters, authentication, and reasoning settings are retained where supported. Any plaintext API key is encrypted before the current settings file atomically replaces the old data. Unsupported schema versions are rejected, and no plaintext backup is created.
 
 ## Connect MCP servers
 
@@ -110,7 +156,7 @@ Remote authorization follows the MCP OAuth flow. The app opens the authorization
 ## Chat, tools, approvals, and cancellation
 
 1. Select **New Chat**.
-2. Use the model selector to the left of the input field to choose a configured deployment. Labels include the API type so identical deployment names remain distinguishable.
+2. Use the model selector below the input field to choose a configured deployment. Labels include the API type so identical deployment names remain distinguishable. Hover over the information icon for state-rebuild details.
 3. Select individual MCP tools or all tools from one server.
 4. Send a message and review streamed output.
 5. For each approval batch, approve selected calls, deny all calls, or enable **Always allow all** for that chat session.
@@ -222,7 +268,7 @@ Build the React client first. Windows has two specs: `pyinstaller --clean mcpcli
 1. From an up-to-date `main` branch, set the next four-part Windows version:
 
   ```text
-  python scripts/version.py set 0.5.0.0
+  python scripts/version.py set <next-four-part-version>
   python scripts/version.py verify
   ```
 
