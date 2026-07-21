@@ -18,7 +18,7 @@ RUN cd client && npm run build
 # -------------------------------
 # Shared runtime stage: Python backend
 # -------------------------------
-FROM python:3.11-slim AS runtime-base
+FROM python:3.14-slim AS runtime-base
 
 # Create working directory
 WORKDIR /app
