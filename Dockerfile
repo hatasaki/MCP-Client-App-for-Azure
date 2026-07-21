@@ -1,7 +1,7 @@
 # -------------------------------
 # Build stage: React client build
 # -------------------------------
-FROM node:24-bookworm-slim AS client-build
+FROM node:26-bookworm-slim AS client-build
 WORKDIR /app
 # Copy only package files first for better layer caching
 COPY client/package.json client/package-lock.json* ./client/
