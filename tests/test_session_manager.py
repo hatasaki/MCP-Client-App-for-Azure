@@ -5,7 +5,25 @@ from pathlib import Path
 
 from agent_framework import AgentSession
 
+from app.foundry_config import FoundrySettings
 from app.session_manager import SessionManager
+
+
+def multi_model_settings() -> FoundrySettings:
+    return FoundrySettings.model_validate({
+        "schemaVersion": 3,
+        "endpointKind": "model",
+        "endpoint": "https://example.services.ai.azure.com",
+        "auth": {"type": "entra_id"},
+        "apiProfiles": [{
+            "apiType": "responses",
+            "models": ["primary", "secondary"],
+            "defaultModel": "primary",
+            "versionMode": "v1",
+            "options": {},
+        }],
+        "defaultSelection": {"apiType": "responses", "model": "primary"},
+    })
 
 
 def test_legacy_session_migrates_without_response_id(tmp_path: Path):
@@ -26,7 +44,8 @@ def test_legacy_session_migrates_without_response_id(tmp_path: Path):
     session = manager.get_session("legacy")
 
     assert session is not None
-    assert session["schemaVersion"] == 2
+    assert session["schemaVersion"] == 3
+    assert session["selectedModel"] is None
     assert "responseId" not in session
     assert all(message["status"] == "completed" for message in session["messages"])
     assert all(message["id"] for message in session["messages"])
@@ -126,3 +145,42 @@ def test_public_session_never_exposes_maf_state_or_fingerprint(tmp_path: Path):
     assert "mafState" not in public
     assert "preRunMafState" not in public
     assert "configFingerprint" not in public
+
+
+def test_selected_model_is_persisted_and_reloaded(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    created = manager.create(
+        "chat",
+        {"apiType": "responses", "model": "primary"},
+    )
+    updated = manager.set_selected_model(
+        "chat",
+        {"apiType": "responses", "model": "secondary"},
+    )
+    reloaded = SessionManager(tmp_path)
+
+    assert created["selectedModel"]["model"] == "primary"
+    assert updated["selectedModel"]["model"] == "secondary"
+    assert reloaded.selected_model("chat").model == "secondary"
+
+
+def test_reconcile_resets_only_missing_or_invalid_model_selections(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    manager.create("valid", {"apiType": "responses", "model": "secondary"})
+    manager.create("removed", {"apiType": "responses", "model": "removed"})
+    manager.create("legacy")
+    timestamps = {
+        session_id: manager.get(session_id)["updatedAt"]
+        for session_id in ("valid", "removed", "legacy")
+    }
+
+    updated = manager.reconcile_model_selections(multi_model_settings())
+
+    assert {session["id"] for session in updated} == {"removed", "legacy"}
+    assert manager.get("valid")["selectedModel"]["model"] == "secondary"
+    assert manager.get("removed")["selectedModel"]["model"] == "primary"
+    assert manager.get("legacy")["selectedModel"]["model"] == "primary"
+    assert {
+        session_id: manager.get(session_id)["updatedAt"]
+        for session_id in ("valid", "removed", "legacy")
+    } == timestamps

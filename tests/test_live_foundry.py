@@ -18,24 +18,29 @@ def _enabled() -> bool:
     return os.environ.get("RUN_FOUNDRY_LIVE_TESTS") == "1"
 
 
+def _project_settings() -> FoundrySettings:
+    model = os.environ["FOUNDRY_MODEL"]
+    return FoundrySettings.model_validate({
+        "schemaVersion": 3,
+        "endpointKind": "project",
+        "endpoint": os.environ["FOUNDRY_PROJECT_ENDPOINT"],
+        "auth": {"type": "entra_id"},
+        "agentInstructions": "Follow the user's requested output format exactly.",
+        "apiProfiles": [{
+            "apiType": "responses",
+            "models": [model],
+            "defaultModel": model,
+            "versionMode": "v1",
+            "options": {"maxOutputTokens": 64, "store": False},
+        }],
+        "defaultSelection": {"apiType": "responses", "model": model},
+    })
+
+
 @pytest.mark.skipif(not _enabled(), reason="Set RUN_FOUNDRY_LIVE_TESTS=1 to run cost-bearing Foundry tests.")
 @pytest.mark.asyncio
 async def test_project_responses_streaming_with_entra_id():
-    endpoint = os.environ["FOUNDRY_PROJECT_ENDPOINT"]
-    model = os.environ["FOUNDRY_MODEL"]
-    settings = FoundrySettings.model_validate({
-        "endpointKind": "project",
-        "endpoint": endpoint,
-        "model": model,
-        "apiType": "responses",
-        "versionMode": "v1",
-        "auth": {"type": "entra_id"},
-        "agentInstructions": "Follow the user's requested output format exactly.",
-        "options": {
-            "maxOutputTokens": 64,
-            "store": False,
-        },
-    })
+    settings = _project_settings()
 
     bundle = ProviderFactory().create(settings)
     agent = Agent(
@@ -59,16 +64,7 @@ async def test_project_responses_streaming_with_entra_id():
 @pytest.mark.skipif(not _enabled(), reason="Set RUN_FOUNDRY_LIVE_TESTS=1 to run cost-bearing Foundry tests.")
 @pytest.mark.asyncio
 async def test_application_runtime_streams_and_persists_project_response(tmp_path):
-    settings = FoundrySettings.model_validate({
-        "endpointKind": "project",
-        "endpoint": os.environ["FOUNDRY_PROJECT_ENDPOINT"],
-        "model": os.environ["FOUNDRY_MODEL"],
-        "apiType": "responses",
-        "versionMode": "v1",
-        "auth": {"type": "entra_id"},
-        "agentInstructions": "Follow the user's requested output format exactly.",
-        "options": {"maxOutputTokens": 64, "store": False},
-    })
+    settings = _project_settings()
     sessions = SessionManager(tmp_path)
     sessions.create("live-session")
     runtime = AgentRuntime(sessions, MCPManager([]))

@@ -86,6 +86,35 @@ def test_claude_route_contract():
     assert route.request_url == "https://demo.services.ai.azure.com/anthropic/v1/messages?beta=true"
 
 
+def test_resolved_non_default_model_controls_dated_deployment_route():
+    settings = FoundrySettings.model_validate({
+        "schemaVersion": 3,
+        "endpointKind": "model",
+        "endpoint": "https://demo.services.ai.azure.com",
+        "auth": {"type": "entra_id"},
+        "apiProfiles": [{
+            "apiType": "chat_completions",
+            "models": ["default-deployment", "selected-deployment"],
+            "defaultModel": "default-deployment",
+            "versionMode": "dated",
+            "apiVersion": "2025-04-01-preview",
+            "options": {},
+        }],
+        "defaultSelection": {
+            "apiType": "chat_completions",
+            "model": "default-deployment",
+        },
+    })
+
+    route = ProviderFactory().describe_route(settings.resolve({
+        "apiType": "chat_completions",
+        "model": "selected-deployment",
+    }))
+
+    assert "/deployments/selected-deployment/chat/completions" in route.request_url
+    assert "default-deployment" not in route.request_url
+
+
 @pytest.mark.asyncio
 async def test_api_key_provider_bundles_close():
     factory = ProviderFactory()

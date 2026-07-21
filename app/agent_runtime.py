@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from agent_framework import Agent, AgentSession, Content, Message
 
-from app.foundry_config import FoundrySettings
+from app.foundry_config import FoundrySettings, ModelSelection, ResolvedFoundrySettings
 from app.mcp_manager import MCPManager
 from app.provider_factory import ProviderFactory
 from app.session_manager import SessionManager
@@ -54,6 +54,15 @@ class RunResult:
     tool_calls: tuple[str, ...]
 
 
+@dataclass(slots=True)
+class RunReservation:
+    session_id: str
+    request_id: str
+    task: asyncio.Task[Any]
+    lock: asyncio.Lock
+    released: bool = False
+
+
 class AgentRuntime:
     """Coordinates MAF Agent streaming, approvals, sessions, and cancellation."""
 
@@ -79,40 +88,69 @@ class AgentRuntime:
         session_id: str,
         message: str,
         selected_tool_ids: Sequence[str],
-        settings: FoundrySettings,
+        settings: FoundrySettings | ResolvedFoundrySettings,
         emit: EventSink,
         request_id: str | None = None,
+        reservation: RunReservation | None = None,
     ) -> RunResult:
         if not message.strip():
             raise ValueError("Message must not be empty.")
-        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-        if lock.locked():
-            raise AgentRunBusyError(f"Session '{session_id}' already has an active run.")
-
         run_request_id = request_id or str(uuid4())
         task = asyncio.current_task()
         if task is None:
             raise AgentRuntimeError("Agent runtime requires an asyncio task.")
+        lease = reservation or await self.reserve_run(session_id, run_request_id)
+        if (
+            lease.session_id != session_id
+            or lease.request_id != run_request_id
+            or lease.task is not task
+            or lease.released
+        ):
+            if not lease.released:
+                await self.release_run(lease)
+            raise AgentRuntimeError("The run reservation does not match this request.")
+        try:
+            snapshot = settings.resolve() if isinstance(settings, FoundrySettings) else settings
+            return await self._run_locked(
+                session_id=session_id,
+                message=message.strip(),
+                selected_tool_ids=selected_tool_ids,
+                settings=snapshot,
+                emit=emit,
+                request_id=run_request_id,
+            )
+        finally:
+            await self.release_run(lease)
 
-        async with lock:
+    async def reserve_run(self, session_id: str, request_id: str) -> RunReservation:
+        """Atomically mark a session active before provider settings are released."""
+        task = asyncio.current_task()
+        if task is None:
+            raise AgentRuntimeError("Agent runtime requires an asyncio task.")
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked():
+            raise AgentRunBusyError(f"Session '{session_id}' already has an active run.")
+        await lock.acquire()
+        try:
             async with self._registry_lock:
                 self._active_tasks[session_id] = task
-                self._active_request_ids[session_id] = run_request_id
-            try:
-                return await self._run_locked(
-                    session_id=session_id,
-                    message=message.strip(),
-                    selected_tool_ids=selected_tool_ids,
-                    settings=settings,
-                    emit=emit,
-                    request_id=run_request_id,
-                )
-            finally:
-                self._cancel_pending_approval(run_request_id)
-                async with self._registry_lock:
-                    if self._active_tasks.get(session_id) is task:
-                        self._active_tasks.pop(session_id, None)
-                        self._active_request_ids.pop(session_id, None)
+                self._active_request_ids[session_id] = request_id
+            return RunReservation(session_id, request_id, task, lock)
+        except BaseException:
+            lock.release()
+            raise
+
+    async def release_run(self, reservation: RunReservation) -> None:
+        if reservation.released:
+            return
+        reservation.released = True
+        self._cancel_pending_approval(reservation.request_id)
+        async with self._registry_lock:
+            if self._active_tasks.get(reservation.session_id) is reservation.task:
+                self._active_tasks.pop(reservation.session_id, None)
+                self._active_request_ids.pop(reservation.session_id, None)
+        if reservation.lock.locked():
+            reservation.lock.release()
 
     async def _run_locked(
         self,
@@ -120,7 +158,7 @@ class AgentRuntime:
         session_id: str,
         message: str,
         selected_tool_ids: Sequence[str],
-        settings: FoundrySettings,
+        settings: ResolvedFoundrySettings,
         emit: EventSink,
         request_id: str,
     ) -> RunResult:
@@ -135,26 +173,15 @@ class AgentRuntime:
                 "mode": "required",
                 "required_function_name": forced_function.name,
             }
-
-        fingerprint = settings.fingerprint()
-        agent_session, replay, state_reset = self.session_manager.prepare_agent_session(session_id, fingerprint)
-        user_message = self.session_manager.append_message(
-            session_id,
-            role="user",
-            content=message,
-            status="completed",
-        )
         assistant_message_id = str(uuid4())
-        self.session_manager.append_message(
-            session_id,
-            role="assistant",
-            content="",
-            status="streaming",
-            message_id=assistant_message_id,
-        )
-        internal_session = self.session_manager.get_session(session_id)
-        epoch = int(internal_session.get("stateEpoch", 0)) if internal_session else 0
+        epoch = 0
         sequence = 0
+        content_parts: list[str] = []
+        executed_tools: list[str] = []
+        tool_calls_by_call_id: dict[str, str] = {}
+        session_prepared = False
+        assistant_persisted = False
+        committed = False
 
         async def send(event: str, payload: Mapping[str, Any] | None = None) -> None:
             nonlocal sequence
@@ -170,19 +197,39 @@ class AgentRuntime:
                 body.update(payload)
             await emit(event, body)
 
-        await send("chat:started", {
-            "userMessageId": user_message["id"],
-            "stateReset": state_reset,
-        })
-
-        current_input: str | list[Message]
-        current_message = Message(role="user", contents=[clean_message])
-        current_input = [*replay, current_message] if replay else clean_message
-
-        content_parts: list[str] = []
-        executed_tools: list[str] = []
-        tool_calls_by_call_id: dict[str, str] = {}
         try:
+            if self.session_manager.selected_model(session_id) != settings.selection:
+                self.session_manager.set_selected_model(session_id, settings.selection)
+
+            fingerprint = settings.fingerprint()
+            agent_session, replay, state_reset = self.session_manager.prepare_agent_session(session_id, fingerprint)
+            session_prepared = True
+            user_message = self.session_manager.append_message(
+                session_id,
+                role="user",
+                content=message,
+                status="completed",
+            )
+            self.session_manager.append_message(
+                session_id,
+                role="assistant",
+                content="",
+                status="streaming",
+                message_id=assistant_message_id,
+            )
+            assistant_persisted = True
+            internal_session = self.session_manager.get_session(session_id)
+            epoch = int(internal_session.get("stateEpoch", 0)) if internal_session else 0
+
+            await send("chat:started", {
+                "userMessageId": user_message["id"],
+                "stateReset": state_reset,
+                "modelSelection": settings.selection.model_dump(mode="json", by_alias=True),
+            })
+
+            current_message = Message(role="user", contents=[clean_message])
+            current_input: str | list[Message]
+            current_input = [*replay, current_message] if replay else clean_message
             bundle = self.provider_factory.create(settings)
             agent = Agent(
                 client=bundle.client,
@@ -248,6 +295,7 @@ class AgentRuntime:
                 toolCalls=executed_tools,
             )
             self.session_manager.save_agent_session(session_id, agent_session, fingerprint)
+            committed = True
             await send("chat:completed", {
                 "content": final_content,
                 "toolCalls": executed_tools,
@@ -262,37 +310,47 @@ class AgentRuntime:
                 tool_calls=tuple(executed_tools),
             )
         except asyncio.CancelledError:
+            if committed:
+                raise
             partial = "".join(content_parts)
-            self.session_manager.update_message(
-                session_id,
-                assistant_message_id,
-                content=partial,
-                status="cancelled",
-                toolCalls=executed_tools,
-            )
-            self.session_manager.rollback_agent_session(session_id)
-            await asyncio.shield(send("chat:cancelled", {
-                "content": partial,
-                "toolCalls": executed_tools,
-                "session": self.session_manager.get_public_session(session_id),
-            }))
+            if assistant_persisted:
+                self.session_manager.update_message(
+                    session_id,
+                    assistant_message_id,
+                    content=partial,
+                    status="cancelled",
+                    toolCalls=executed_tools,
+                )
+            if session_prepared:
+                self.session_manager.rollback_agent_session(session_id)
+            if assistant_persisted:
+                await asyncio.shield(send("chat:cancelled", {
+                    "content": partial,
+                    "toolCalls": executed_tools,
+                    "session": self.session_manager.get_public_session(session_id),
+                }))
             raise
         except Exception as exc:
+            if committed:
+                raise
             partial = "".join(content_parts)
-            self.session_manager.update_message(
-                session_id,
-                assistant_message_id,
-                content=partial,
-                status="error",
-                toolCalls=executed_tools,
-            )
-            self.session_manager.rollback_agent_session(session_id)
-            await send("chat:error", {
-                "code": type(exc).__name__,
-                "message": self._safe_error_message(exc, settings.api_key),
-                "content": partial,
-                "session": self.session_manager.get_public_session(session_id),
-            })
+            if assistant_persisted:
+                self.session_manager.update_message(
+                    session_id,
+                    assistant_message_id,
+                    content=partial,
+                    status="error",
+                    toolCalls=executed_tools,
+                )
+            if session_prepared:
+                self.session_manager.rollback_agent_session(session_id)
+            if assistant_persisted:
+                await send("chat:error", {
+                    "code": type(exc).__name__,
+                    "message": self._safe_error_message(exc, settings.api_key),
+                    "content": partial,
+                    "session": self.session_manager.get_public_session(session_id),
+                })
             raise
 
     async def _handle_tool_content(
@@ -406,6 +464,66 @@ class AgentRuntime:
         task.cancel()
         return True
 
+    async def cancel_and_wait(self, session_id: str, request_id: str | None = None) -> bool:
+        task = self._active_tasks.get(session_id)
+        if not await self.cancel(session_id, request_id):
+            return False
+        if task is not None and task is not asyncio.current_task():
+            await asyncio.gather(task, return_exceptions=True)
+        return True
+
+    def is_active(self, session_id: str) -> bool:
+        task = self._active_tasks.get(session_id)
+        return bool(task and not task.done())
+
+    async def set_selected_model(
+        self,
+        session_id: str,
+        selection: ModelSelection,
+    ) -> dict[str, Any]:
+        """Persist a model selection only when the session has no active run."""
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked():
+            raise AgentRunBusyError(f"Session '{session_id}' already has an active run.")
+        async with lock:
+            return self.session_manager.set_selected_model(session_id, selection)
+
+    async def apply_settings_update(
+        self,
+        settings: FoundrySettings,
+        persist: Callable[[], FoundrySettings],
+    ) -> tuple[FoundrySettings, list[dict[str, Any]]]:
+        """Persist settings and reconcile affected sessions under their run locks."""
+        affected = [
+            session_id
+            for session_id in self.session_manager.sessions
+            if not settings.selection_exists(self.session_manager.selected_model(session_id))
+        ]
+        locks = [self._session_locks.setdefault(session_id, asyncio.Lock()) for session_id in affected]
+        if any(lock.locked() for lock in locks):
+            raise AgentRunBusyError(
+                "Foundry settings cannot remove a model used by an active run. "
+                "Cancel or complete the run and save again."
+            )
+        acquired: list[asyncio.Lock] = []
+        try:
+            for lock in locks:
+                await lock.acquire()
+                acquired.append(lock)
+            persisted = persist()
+            updated = [
+                self.session_manager.set_selected_model(
+                    session_id,
+                    persisted.default_selection,
+                    touch=False,
+                )
+                for session_id in affected
+            ]
+            return persisted, updated
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
+
     async def shutdown(self) -> None:
         tasks = [task for task in self._active_tasks.values() if not task.done()]
         for run_request_id in list(self._pending_approvals):
@@ -476,4 +594,5 @@ __all__ = [
     "ApprovalDecision",
     "ApprovalNotFoundError",
     "RunResult",
+    "RunReservation",
 ]

@@ -92,6 +92,31 @@ jobs:
       - name: Smoke-test container backend import
         run: docker run --rm mcp-client-foundry:smoke python -c "import backend.main; print('container backend import OK')"
 
+      - name: Smoke-test container encrypted settings persistence
+        shell: bash
+        run: |
+          set -euo pipefail
+          volume="mcpclient-encryption-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          key="$(python -c 'from app.secret_protection import generate_master_key; print(generate_master_key())')"
+          wrong_key="$(python -c 'from app.secret_protection import generate_master_key; print(generate_master_key())')"
+          cleanup() { docker volume rm --force "$volume" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker volume create "$volume" >/dev/null
+          common=(--rm -v "$volume:/data" -v "$PWD/scripts/smoke_container_encryption.py:/app/smoke.py:ro")
+          docker run "${common[@]}" -e MCPCLIENT_ENCRYPTION_KEY="$key" \
+            mcp-client-foundry:smoke python /app/smoke.py write
+          docker run "${common[@]}" -e MCPCLIENT_ENCRYPTION_KEY="$key" \
+            mcp-client-foundry:smoke python /app/smoke.py read
+          if docker run "${common[@]}" mcp-client-foundry:smoke python /app/smoke.py read; then
+            echo "Encrypted settings unexpectedly loaded without MCPCLIENT_ENCRYPTION_KEY" >&2
+            exit 1
+          fi
+          if docker run "${common[@]}" -e MCPCLIENT_ENCRYPTION_KEY="$wrong_key" \
+            mcp-client-foundry:smoke python /app/smoke.py read; then
+            echo "Encrypted settings unexpectedly loaded with a different key" >&2
+            exit 1
+          fi
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:

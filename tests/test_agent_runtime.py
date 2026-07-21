@@ -21,16 +21,25 @@ from app.provider_factory import ProviderBundle, RouteDescriptor
 from app.session_manager import SessionManager
 
 
-def settings(instructions: str = "New instructions") -> FoundrySettings:
+def settings(
+    instructions: str = "New instructions",
+    models: list[str] | None = None,
+) -> FoundrySettings:
+    deployments = models or ["deployment"]
     return FoundrySettings.model_validate({
+        "schemaVersion": 3,
         "endpointKind": "model",
         "endpoint": "https://example.openai.azure.com",
-        "model": "deployment",
-        "apiType": "responses",
-        "versionMode": "v1",
         "auth": {"type": "api_key", "apiKey": "secret"},
         "agentInstructions": instructions,
-        "options": {"store": False},
+        "apiProfiles": [{
+            "apiType": "responses",
+            "models": deployments,
+            "defaultModel": deployments[0],
+            "versionMode": "v1",
+            "options": {"store": False},
+        }],
+        "defaultSelection": {"apiType": "responses", "model": deployments[0]},
     })
 
 
@@ -120,6 +129,10 @@ async def test_runtime_streams_and_persists_completed_message(tmp_path: Path):
         "chat:completed",
     ]
     assert [event[1]["sequence"] for event in events] == [1, 2, 3, 4]
+    assert events[0][1]["modelSelection"] == {
+        "apiType": "responses",
+        "model": "deployment",
+    }
     public = sessions.get("chat")
     assert public["messages"][-1]["status"] == "completed"
     assert public["messages"][-1]["content"] == "Hello world"
@@ -179,6 +192,70 @@ async def test_runtime_cancel_retains_partial_display_and_rolls_back(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_cancellation_during_started_event_never_leaves_streaming_message(tmp_path: Path):
+    sessions = SessionManager(tmp_path)
+    sessions.create("chat")
+    runtime = AgentRuntime(
+        sessions,
+        MCPManager([]),
+        provider_factory=FakeProviderFactory(FakeStreamingClient(["unused"])),
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def cancel_at_started(event: str, payload: dict[str, Any]):
+        events.append((event, payload))
+        if event == "chat:started":
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.run(
+            session_id="chat",
+            message="hello",
+            selected_tool_ids=[],
+            settings=settings(),
+            emit=cancel_at_started,
+        )
+
+    assistant = sessions.get("chat")["messages"][-1]
+    assert assistant["status"] == "cancelled"
+    assert sessions.get_session("chat")["mafState"] is None
+    assert [event for event, _ in events] == ["chat:started", "chat:cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_completed_event_never_downgrades_committed_state(tmp_path: Path):
+    sessions = SessionManager(tmp_path)
+    sessions.create("chat")
+    runtime = AgentRuntime(
+        sessions,
+        MCPManager([]),
+        provider_factory=FakeProviderFactory(FakeStreamingClient(["complete"])),
+    )
+
+    async def cancel_at_completed(event: str, _payload: dict[str, Any]):
+        if event == "chat:completed":
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.run(
+            session_id="chat",
+            message="hello",
+            selected_tool_ids=[],
+            settings=settings(),
+            emit=cancel_at_completed,
+        )
+
+    internal = sessions.get_session("chat")
+    assistant = internal["messages"][-1]
+    assert assistant["status"] == "completed"
+    assert assistant["content"] == "complete"
+    assert isinstance(internal["mafState"], dict)
+    assert internal["preRunMafState"] is None
+
+
+@pytest.mark.asyncio
 async def test_runtime_rejects_second_run_for_same_session(tmp_path: Path):
     sessions = SessionManager(tmp_path)
     sessions.create("chat")
@@ -233,6 +310,7 @@ async def test_invalid_selected_tool_is_rejected_before_session_mutation(tmp_pat
         )
 
     assert sessions.get("chat")["messages"] == []
+    assert sessions.get("chat")["selectedModel"] is None
     assert events == []
 
 
@@ -383,6 +461,119 @@ async def test_settings_change_replays_completed_text_under_new_instructions(tmp
     assert ("assistant", "cancelled") not in sent_text
     assert ("user", "new question") in sent_text
     assert events[0][1]["stateReset"] is True
+
+
+@pytest.mark.asyncio
+async def test_model_change_rebuilds_state_and_replays_completed_text(tmp_path: Path):
+    sessions = SessionManager(tmp_path)
+    sessions.create("chat", {"apiType": "responses", "model": "primary"})
+    configured = settings(models=["primary", "secondary"])
+    client = FakeStreamingClient(["answer"])
+    runtime = AgentRuntime(
+        sessions,
+        MCPManager([]),
+        provider_factory=FakeProviderFactory(client),
+    )
+
+    first_events: list[tuple[str, dict[str, Any]]] = []
+    await runtime.run(
+        session_id="chat",
+        message="first question",
+        selected_tool_ids=[],
+        settings=configured.resolve({"apiType": "responses", "model": "primary"}),
+        emit=lambda event, payload: _capture(first_events, event, payload),
+    )
+
+    second_events: list[tuple[str, dict[str, Any]]] = []
+    await runtime.run(
+        session_id="chat",
+        message="second question",
+        selected_tool_ids=[],
+        settings=configured.resolve({"apiType": "responses", "model": "secondary"}),
+        emit=lambda event, payload: _capture(second_events, event, payload),
+    )
+
+    replayed = [(message.role, message.text) for message in client.calls[1][0]]
+    assert ("user", "first question") in replayed
+    assert ("assistant", "answer") in replayed
+    assert ("user", "second question") in replayed
+    assert second_events[0][1]["stateReset"] is True
+    assert second_events[0][1]["modelSelection"]["model"] == "secondary"
+    assert sessions.get("chat")["selectedModel"]["model"] == "secondary"
+
+
+@pytest.mark.asyncio
+async def test_model_selection_cannot_change_while_run_lock_is_active(tmp_path: Path):
+    sessions = SessionManager(tmp_path)
+    sessions.create("chat", {"apiType": "responses", "model": "primary"})
+    configured = settings(models=["primary", "secondary"])
+    gate = asyncio.Event()
+    events: list[tuple[str, dict[str, Any]]] = []
+    runtime = AgentRuntime(
+        sessions,
+        MCPManager([]),
+        provider_factory=FakeProviderFactory(FakeStreamingClient(["partial", "done"], gate)),
+    )
+    task = asyncio.create_task(runtime.run(
+        session_id="chat",
+        message="question",
+        selected_tool_ids=[],
+        settings=configured.resolve({"apiType": "responses", "model": "primary"}),
+        emit=lambda event, payload: _capture(events, event, payload),
+    ))
+    while not any(event == "chat:delta" for event, _ in events):
+        await asyncio.sleep(0)
+
+    with pytest.raises(AgentRunBusyError):
+        await runtime.set_selected_model(
+            "chat",
+            configured.resolve({"apiType": "responses", "model": "secondary"}).selection,
+        )
+    assert sessions.get("chat")["selectedModel"]["model"] == "primary"
+
+    await runtime.cancel("chat")
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_settings_reconciliation_cannot_remove_active_run_model(tmp_path: Path):
+    sessions = SessionManager(tmp_path)
+    sessions.create("chat", {"apiType": "responses", "model": "secondary"})
+    configured = settings(models=["primary", "secondary"])
+    replacement = settings(models=["primary"])
+    gate = asyncio.Event()
+    events: list[tuple[str, dict[str, Any]]] = []
+    runtime = AgentRuntime(
+        sessions,
+        MCPManager([]),
+        provider_factory=FakeProviderFactory(FakeStreamingClient(["partial", "done"], gate)),
+    )
+    task = asyncio.create_task(runtime.run(
+        session_id="chat",
+        message="question",
+        selected_tool_ids=[],
+        settings=configured.resolve({"apiType": "responses", "model": "secondary"}),
+        emit=lambda event, payload: _capture(events, event, payload),
+    ))
+    while not any(event == "chat:delta" for event, _ in events):
+        await asyncio.sleep(0)
+
+    persisted = False
+
+    def persist():
+        nonlocal persisted
+        persisted = True
+        return replacement
+
+    with pytest.raises(AgentRunBusyError, match="cannot remove"):
+        await runtime.apply_settings_update(replacement, persist)
+    assert persisted is False
+    assert sessions.get("chat")["selectedModel"]["model"] == "secondary"
+
+    await runtime.cancel("chat")
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 async def _capture(events: list[tuple[str, dict[str, Any]]], event: str, payload: dict[str, Any]):

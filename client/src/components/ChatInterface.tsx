@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Avatar,
@@ -15,6 +15,7 @@ import {
   IconButton,
   List,
   ListItem,
+  MenuItem,
   Paper,
   TextField,
   Tooltip,
@@ -22,6 +23,7 @@ import {
 } from '@mui/material';
 import BuildIcon from '@mui/icons-material/Build';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
+import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import PersonIcon from '@mui/icons-material/Person';
 import SendIcon from '@mui/icons-material/Send';
 import SmartToyIcon from '@mui/icons-material/SmartToy';
@@ -37,7 +39,9 @@ import {
   ChatStartedEvent,
   ChatTerminalEvent,
   ChatToolStatusEvent,
+  FoundrySettings,
   MCPTool,
+  ModelSelection,
   SelectedTool,
 } from '../types';
 
@@ -45,6 +49,7 @@ interface ChatInterfaceProps {
   session: ChatSession;
   availableTools: MCPTool[];
   settingsConfigured: boolean;
+  settings: FoundrySettings;
   socket: Socket | null;
 }
 
@@ -52,6 +57,12 @@ interface LiveMessage {
   messageId: string;
   content: string;
 }
+
+const API_LABELS: Record<ModelSelection['apiType'], string> = {
+  responses: 'Responses',
+  chat_completions: 'Chat Completions',
+  claude_messages: 'Claude Messages',
+};
 
 const makeRequestId = () =>
   typeof crypto !== 'undefined' && crypto.randomUUID
@@ -62,6 +73,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   session,
   availableTools,
   settingsConfigured,
+  settings,
   socket,
 }) => {
   const [message, setMessage] = useState('');
@@ -73,6 +85,17 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const [toolStatuses, setToolStatuses] = useState<ChatToolStatusEvent[]>([]);
   const [approvalBatch, setApprovalBatch] = useState<ChatApprovalRequiredEvent | null>(null);
   const [approvalDecisions, setApprovalDecisions] = useState<Record<string, boolean>>({});
+  const availableModels = useMemo(() => settings.apiProfiles.flatMap((profile) =>
+    profile.models.map((model) => ({ apiType: profile.apiType, model }))
+  ), [settings.apiProfiles]);
+  const modelKey = useCallback((selection: ModelSelection) =>
+    JSON.stringify([selection.apiType, selection.model]), []);
+  const validSelection = useCallback((selection?: ModelSelection | null) =>
+    !!selection && availableModels.some((item) => modelKey(item) === modelKey(selection)),
+  [availableModels, modelKey]);
+  const [selectedModel, setSelectedModel] = useState<ModelSelection>(() =>
+    validSelection(session.selectedModel) ? session.selectedModel! : settings.defaultSelection
+  );
   const activeRequestRef = useRef<string | null>(null);
   const lastSequenceRef = useRef(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -101,6 +124,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       if (event.stateReset) {
         setErrorMessage('Agent state was rebuilt. Completed text history was replayed under the current settings.');
       }
+      setSelectedModel(event.modelSelection);
     };
     const delta = (event: ChatDeltaEvent) => {
       if (!accepts(event)) return;
@@ -132,6 +156,15 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       if (event.message) setErrorMessage(event.message);
       activeRequestRef.current = null;
     };
+    const disconnected = () => {
+      activeRequestRef.current = null;
+      lastSequenceRef.current = 0;
+      setIsLoading(false);
+      setApprovalBatch(null);
+      setToolStatuses([]);
+      setLiveMessage(null);
+      setErrorMessage('Connection was interrupted. The server cancelled any active run.');
+    };
 
     socket.on('chat:started', started);
     socket.on('chat:delta', delta);
@@ -140,6 +173,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     socket.on('chat:completed', terminal);
     socket.on('chat:cancelled', terminal);
     socket.on('chat:error', terminal);
+    socket.on('disconnect', disconnected);
     return () => {
       socket.off('chat:started', started);
       socket.off('chat:delta', delta);
@@ -148,6 +182,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       socket.off('chat:completed', terminal);
       socket.off('chat:cancelled', terminal);
       socket.off('chat:error', terminal);
+      socket.off('disconnect', disconnected);
     };
   }, [socket, session.id]);
 
@@ -170,6 +205,10 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     setApprovalBatch(null);
     setApprovalDecisions({});
   }, [session.id]);
+
+  useEffect(() => {
+    setSelectedModel(validSelection(session.selectedModel) ? session.selectedModel! : settings.defaultSelection);
+  }, [session.id, session.selectedModel, settings.defaultSelection, validSelection]);
 
   useEffect(() => {
     setSelectedTools((current) => current.filter((selected) =>
@@ -200,6 +239,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       sessionId: session.id,
       message: message.trim(),
       selectedToolIds: selectedTools.map((tool) => tool.id),
+      selectedModel,
     });
     setMessage('');
   };
@@ -313,7 +353,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       </Box>
 
       <Paper sx={{ p: 2, mt: 'auto', bgcolor: 'background.default' }}>
-        <Box sx={{ display: 'flex', alignItems: 'center' }}>
+        <Box data-testid="message-input-row" sx={{ display: 'flex', alignItems: 'center' }}>
           <TextField
             fullWidth
             multiline
@@ -335,6 +375,37 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
           <IconButton aria-label="Send message" color="primary" onClick={sendMessage} disabled={!message.trim() || !settingsConfigured || isLoading} sx={{ ml: 1 }}>
             {isLoading ? <CircularProgress size={24} /> : <SendIcon />}
           </IconButton>
+        </Box>
+        <Box data-testid="model-selector-row" sx={{ display: 'flex', alignItems: 'flex-start', mt: 1.5 }}>
+          <TextField
+            select
+            label="Model"
+            size="small"
+            value={modelKey(selectedModel)}
+            disabled={isLoading || !availableModels.length}
+            onChange={(event) => {
+              const [apiType, model] = JSON.parse(event.target.value) as [ModelSelection['apiType'], string];
+              const selection = { apiType, model };
+              setSelectedModel(selection);
+              socket?.emit('setSessionModel', { sessionId: session.id, selectedModel: selection });
+            }}
+            sx={{ width: { xs: '100%', sm: 320 }, maxWidth: '100%' }}
+          >
+            {availableModels.map((selection) => (
+              <MenuItem key={modelKey(selection)} value={modelKey(selection)}>
+                {selection.model} · {API_LABELS[selection.apiType]}
+              </MenuItem>
+            ))}
+          </TextField>
+          <Tooltip title="Switching models rebuilds agent state and replays completed text.">
+            <IconButton
+              aria-label="Model switching information"
+              size="small"
+              sx={{ ml: 0.5, mt: 0.5 }}
+            >
+              <InfoOutlinedIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
         </Box>
       </Paper>
 

@@ -16,11 +16,14 @@ from pydantic import (
     Field,
     SecretStr,
     TypeAdapter,
+    ValidationError,
     field_validator,
     model_validator,
 )
 
-SCHEMA_VERSION = 2
+from app.secret_protection import SecretProtectionError, SecretProtector
+
+SCHEMA_VERSION = 3
 
 DEFAULT_AGENT_INSTRUCTIONS = (
     "Based on the user's instructions, analyze the user's intent, define goals to achieve that intent, "
@@ -246,9 +249,6 @@ class ClaudeMessagesOptions(StrictModel):
                 options["output_config"] = {"effort": value}
             elif key == "parallel_tool_use":
                 options["allow_multiple_tool_calls"] = value
-                # MAF emits Anthropic's disable_parallel_tool_use only when a
-                # tool choice exists. Explicit auto preserves default selection
-                # while keeping false distinct from an omitted setting.
                 options.setdefault("tool_choice", "auto")
             elif key == "metadata_user_id":
                 options["metadata"] = {"user_id": value}
@@ -260,93 +260,88 @@ class ClaudeMessagesOptions(StrictModel):
 OptionsType = ResponsesOptions | ChatCompletionsOptions | ClaudeMessagesOptions
 
 
-class FoundrySettings(StrictModel):
-    schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
+class ModelSelection(StrictModel):
+    api_type: ApiType
+    model: str
+
+    def key(self) -> str:
+        return f"{self.api_type.value}:{self.model}"
+
+
+class ApiProfileBase(StrictModel):
+    models: Annotated[list[str], Field(min_length=1)]
+    default_model: str
+    version_mode: VersionMode
+    api_version: str | None = None
+
+    @field_validator("models")
+    @classmethod
+    def validate_models(cls, value: list[str]) -> list[str]:
+        if any(not model for model in value):
+            raise ValueError("Model deployment names must not be empty.")
+        if len(value) != len(set(value)):
+            raise ValueError("Model deployment names must be unique within an API type.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_default_model(self) -> "ApiProfileBase":
+        if self.default_model not in self.models:
+            raise ValueError("defaultModel must reference a configured model deployment.")
+        return self
+
+    def to_maf_options(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+class ResponsesProfile(ApiProfileBase):
+    api_type: Literal[ApiType.RESPONSES] = ApiType.RESPONSES
+    options: ResponsesOptions = Field(default_factory=ResponsesOptions)
+
+    def to_maf_options(self) -> dict[str, Any]:
+        return self.options.to_maf_options()
+
+
+class ChatCompletionsProfile(ApiProfileBase):
+    api_type: Literal[ApiType.CHAT_COMPLETIONS] = ApiType.CHAT_COMPLETIONS
+    options: ChatCompletionsOptions = Field(default_factory=ChatCompletionsOptions)
+
+    def to_maf_options(self) -> dict[str, Any]:
+        return self.options.to_maf_options()
+
+
+class ClaudeMessagesProfile(ApiProfileBase):
+    api_type: Literal[ApiType.CLAUDE_MESSAGES] = ApiType.CLAUDE_MESSAGES
+    options: ClaudeMessagesOptions
+
+    def to_maf_options(self) -> dict[str, Any]:
+        return self.options.to_maf_options()
+
+
+ApiProfile = Annotated[
+    ResponsesProfile | ChatCompletionsProfile | ClaudeMessagesProfile,
+    Field(discriminator="api_type"),
+]
+
+
+class ResolvedFoundrySettings(StrictModel):
     endpoint_kind: EndpointKind
     endpoint: str
     model: str
     api_type: ApiType
     version_mode: VersionMode
     api_version: str | None = None
-    auth: AuthConfig = Field(default_factory=AuthConfig)
-    agent_instructions: str = DEFAULT_AGENT_INSTRUCTIONS
+    auth: AuthConfig
+    agent_instructions: str
     options: OptionsType
     credential_revision: Annotated[int, Field(ge=0)] = 0
-
-    @field_validator("endpoint")
-    @classmethod
-    def validate_endpoint(cls, value: str) -> str:
-        if not value:
-            raise ValueError("Endpoint is required.")
-        return value
-
-    @field_validator("model")
-    @classmethod
-    def validate_model_name(cls, value: str) -> str:
-        if not value:
-            raise ValueError("Model deployment name is required.")
-        return value
-
-    @model_validator(mode="before")
-    @classmethod
-    def parse_options_for_api(cls, data: Any) -> Any:
-        if not isinstance(data, Mapping):
-            return data
-        mutable = dict(data)
-        api_value = mutable.get("api_type", mutable.get("apiType"))
-        options = mutable.get("options") or {}
-        if isinstance(api_value, ApiType):
-            api_value = api_value.value
-        option_models: dict[str, type[StrictModel]] = {
-            ApiType.RESPONSES.value: ResponsesOptions,
-            ApiType.CHAT_COMPLETIONS.value: ChatCompletionsOptions,
-            ApiType.CLAUDE_MESSAGES.value: ClaudeMessagesOptions,
-        }
-        option_model = option_models.get(str(api_value))
-        if option_model and not isinstance(options, option_model):
-            mutable["options"] = option_model.model_validate(options)
-        return mutable
-
-    @model_validator(mode="after")
-    def validate_matrix(self) -> "FoundrySettings":
-        if self.endpoint_kind == EndpointKind.PROJECT:
-            object.__setattr__(self, "endpoint", normalize_project_endpoint(self.endpoint))
-            if self.api_type != ApiType.RESPONSES:
-                raise ValueError("Project endpoints support the Responses API only.")
-            if self.version_mode != VersionMode.V1:
-                raise ValueError("Project endpoints use the v1 API and do not accept a dated API version.")
-            if self.auth.type != AuthType.ENTRA_ID:
-                raise ValueError(
-                    "Project endpoints use Entra ID with FoundryChatClient. Select a Model endpoint to use an API key."
-                )
-            if self.api_version is not None:
-                raise ValueError("apiVersion must be omitted for Project endpoints.")
-        else:
-            object.__setattr__(self, "endpoint", normalize_model_endpoint(self.endpoint))
-            if self.api_type == ApiType.CLAUDE_MESSAGES:
-                if self.version_mode != VersionMode.PROVIDER:
-                    raise ValueError("Claude Messages uses its provider API version mode.")
-                if self.api_version is not None:
-                    raise ValueError("apiVersion must be omitted for Claude Messages.")
-            elif self.version_mode == VersionMode.PROVIDER:
-                raise ValueError("Provider version mode is valid only for Claude Messages.")
-            elif self.version_mode == VersionMode.DATED:
-                if not self.api_version or not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:-preview)?", self.api_version):
-                    raise ValueError("A dated API version such as 2025-04-01-preview is required.")
-            elif self.api_version is not None:
-                raise ValueError("apiVersion must be omitted when versionMode is v1.")
-        expected_options: dict[ApiType, type[StrictModel]] = {
-            ApiType.RESPONSES: ResponsesOptions,
-            ApiType.CHAT_COMPLETIONS: ChatCompletionsOptions,
-            ApiType.CLAUDE_MESSAGES: ClaudeMessagesOptions,
-        }
-        if not isinstance(self.options, expected_options[self.api_type]):
-            raise ValueError(f"options do not match apiType '{self.api_type.value}'.")
-        return self
 
     @property
     def api_key(self) -> str | None:
         return self.auth.api_key.get_secret_value() if self.auth.api_key else None
+
+    @property
+    def selection(self) -> ModelSelection:
+        return ModelSelection(api_type=self.api_type, model=self.model)
 
     def to_maf_options(self) -> dict[str, Any]:
         return self.options.to_maf_options()
@@ -355,20 +350,10 @@ class FoundrySettings(StrictModel):
         payload = self.model_dump(
             mode="json",
             by_alias=True,
-            exclude={"credential_revision"},
+            exclude={"credential_revision", "auth"},
             exclude_none=True,
         )
-        payload["auth"] = {
-            "type": self.auth.type.value,
-            "apiKeyConfigured": bool(self.auth.api_key),
-        }
-        return payload
-
-    def storage_dict(self) -> dict[str, Any]:
-        payload = self.model_dump(mode="json", by_alias=True, exclude_none=True)
-        payload["auth"] = {"type": self.auth.type.value}
-        if self.api_key:
-            payload["auth"]["apiKey"] = self.api_key
+        payload["auth"] = {"type": self.auth.type.value, "apiKeyConfigured": bool(self.auth.api_key)}
         return payload
 
     def fingerprint(self) -> str:
@@ -378,24 +363,218 @@ class FoundrySettings(StrictModel):
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _upgrade_v2_payload(data: Mapping[str, Any]) -> dict[str, Any]:
+    mutable = dict(data)
+    model = str(mutable.pop("model", "")).strip()
+    api_type = str(mutable.pop("apiType", mutable.pop("api_type", "responses")))
+    version_mode = mutable.pop("versionMode", mutable.pop("version_mode", "v1"))
+    api_version = mutable.pop("apiVersion", mutable.pop("api_version", None))
+    options = mutable.pop("options", {})
+    if not model:
+        raise ValueError("The v2 settings file does not contain a model deployment name.")
+    mutable["schemaVersion"] = SCHEMA_VERSION
+    mutable["apiProfiles"] = [{
+        "apiType": api_type,
+        "models": [model],
+        "defaultModel": model,
+        "versionMode": version_mode,
+        "apiVersion": api_version,
+        "options": options,
+    }]
+    mutable["defaultSelection"] = {"apiType": api_type, "model": model}
+    return mutable
+
+
+class FoundrySettings(StrictModel):
+    schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
+    endpoint_kind: EndpointKind
+    endpoint: str
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+    agent_instructions: str = DEFAULT_AGENT_INSTRUCTIONS
+    api_profiles: Annotated[list[ApiProfile], Field(min_length=1)]
+    default_selection: ModelSelection
+    credential_revision: Annotated[int, Field(ge=0)] = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_v2_shape(cls, data: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return data
+        if "apiProfiles" not in data and "api_profiles" not in data and ("model" in data):
+            return _upgrade_v2_payload(data)
+        return data
+
+    @field_validator("endpoint")
+    @classmethod
+    def validate_endpoint(cls, value: str) -> str:
+        if not value:
+            raise ValueError("Endpoint is required.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_matrix(self) -> "FoundrySettings":
+        profile_types = [profile.api_type for profile in self.api_profiles]
+        if len(profile_types) != len(set(profile_types)):
+            raise ValueError("Only one configuration may be stored for each API type.")
+
+        if self.endpoint_kind == EndpointKind.PROJECT:
+            object.__setattr__(self, "endpoint", normalize_project_endpoint(self.endpoint))
+            if profile_types != [ApiType.RESPONSES]:
+                raise ValueError("Project endpoints support a Responses API configuration only.")
+            if self.auth.type != AuthType.ENTRA_ID:
+                raise ValueError(
+                    "Project endpoints use Entra ID with FoundryChatClient. Select a Model endpoint to use an API key."
+                )
+        else:
+            object.__setattr__(self, "endpoint", normalize_model_endpoint(self.endpoint))
+        if not self.endpoint.startswith("https://"):
+            raise ValueError("Microsoft Foundry endpoints require HTTPS.")
+
+        for profile in self.api_profiles:
+            if self.endpoint_kind == EndpointKind.PROJECT:
+                if profile.version_mode != VersionMode.V1 or profile.api_version is not None:
+                    raise ValueError("Project endpoints use v1 and do not accept a dated API version.")
+            elif profile.api_type == ApiType.CLAUDE_MESSAGES:
+                if profile.version_mode != VersionMode.PROVIDER or profile.api_version is not None:
+                    raise ValueError("Claude Messages uses provider version mode without apiVersion.")
+            elif profile.version_mode == VersionMode.PROVIDER:
+                raise ValueError("Provider version mode is valid only for Claude Messages.")
+            elif profile.version_mode == VersionMode.DATED:
+                if not profile.api_version or not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:-preview)?", profile.api_version):
+                    raise ValueError("A dated API version such as 2025-04-01-preview is required.")
+            elif profile.api_version is not None:
+                raise ValueError("apiVersion must be omitted when versionMode is v1.")
+
+        self.resolve(self.default_selection)
+        return self
+
+    @property
+    def api_key(self) -> str | None:
+        return self.auth.api_key.get_secret_value() if self.auth.api_key else None
+
+    def get_profile(self, api_type: ApiType | str) -> ApiProfile:
+        normalized = ApiType(api_type)
+        profile = next((item for item in self.api_profiles if item.api_type == normalized), None)
+        if profile is None:
+            raise KeyError(f"API type '{normalized.value}' is not configured.")
+        return profile
+
+    def resolve(self, selection: ModelSelection | Mapping[str, Any] | None = None) -> ResolvedFoundrySettings:
+        selected = self.default_selection if selection is None else (
+            selection if isinstance(selection, ModelSelection) else ModelSelection.model_validate(selection)
+        )
+        profile = self.get_profile(selected.api_type)
+        if selected.model not in profile.models:
+            raise KeyError(
+                f"Model deployment '{selected.model}' is not configured for API type '{selected.api_type.value}'."
+            )
+        return ResolvedFoundrySettings(
+            endpoint_kind=self.endpoint_kind,
+            endpoint=self.endpoint,
+            model=selected.model,
+            api_type=selected.api_type,
+            version_mode=profile.version_mode,
+            api_version=profile.api_version,
+            auth=self.auth,
+            agent_instructions=self.agent_instructions,
+            options=profile.options,
+            credential_revision=self.credential_revision,
+        )
+
+    def selection_exists(self, selection: ModelSelection | Mapping[str, Any] | None) -> bool:
+        if selection is None:
+            return False
+        try:
+            self.resolve(selection)
+            return True
+        except (KeyError, ValueError):
+            return False
+
+    def available_selections(self) -> list[ModelSelection]:
+        return [
+            ModelSelection(api_type=profile.api_type, model=model)
+            for profile in self.api_profiles
+            for model in profile.models
+        ]
+
+    # Compatibility properties use the configured default selection.
+    @property
+    def model(self) -> str:
+        return self.default_selection.model
+
+    @property
+    def api_type(self) -> ApiType:
+        return self.default_selection.api_type
+
+    @property
+    def version_mode(self) -> VersionMode:
+        return self.get_profile(self.api_type).version_mode
+
+    @property
+    def api_version(self) -> str | None:
+        return self.get_profile(self.api_type).api_version
+
+    @property
+    def options(self) -> OptionsType:
+        return self.get_profile(self.api_type).options
+
+    def to_maf_options(self) -> dict[str, Any]:
+        return self.resolve().to_maf_options()
+
+    def fingerprint(self) -> str:
+        return self.resolve().fingerprint()
+
+    def public_dict(self) -> dict[str, Any]:
+        payload = self.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude={"credential_revision", "auth"},
+            exclude_none=True,
+        )
+        payload["auth"] = {"type": self.auth.type.value, "apiKeyConfigured": bool(self.auth.api_key)}
+        return payload
+
+    def storage_dict(self, protector: SecretProtector) -> dict[str, Any]:
+        payload = self.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude={"auth"},
+            exclude_none=True,
+        )
+        payload["auth"] = {"type": self.auth.type.value}
+        if self.api_key:
+            payload["auth"]["apiKeyEncrypted"] = protector.encrypt(
+                self.api_key,
+                context=_storage_encryption_context(payload),
+            )
+        return payload
+
+
 class FoundrySettingsWrite(StrictModel):
     schema_version: Literal[SCHEMA_VERSION] = SCHEMA_VERSION
     endpoint_kind: EndpointKind
     endpoint: str
-    model: str
-    api_type: ApiType
-    version_mode: VersionMode
-    api_version: str | None = None
     auth: AuthUpdate = Field(default_factory=AuthUpdate)
     agent_instructions: str = DEFAULT_AGENT_INSTRUCTIONS
-    options: dict[str, Any] = Field(default_factory=dict)
+    api_profiles: Annotated[list[ApiProfile], Field(min_length=1)]
+    default_selection: ModelSelection
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_v2_shape(cls, data: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return data
+        if "apiProfiles" not in data and "api_profiles" not in data and "model" in data:
+            return _upgrade_v2_payload(data)
+        return data
 
     def resolve(self, existing: FoundrySettings | None) -> FoundrySettings:
         current_key = existing.api_key if existing else None
         revision = existing.credential_revision if existing else 0
+        previous_auth_type = existing.auth.type if existing else None
         if self.auth.type == AuthType.ENTRA_ID:
             resolved_key = None
-            if current_key is not None or (existing and existing.auth.type != AuthType.ENTRA_ID):
+            if current_key is not None or previous_auth_type not in {None, AuthType.ENTRA_ID}:
                 revision += 1
         elif self.auth.api_key.action == SecretAction.SET:
             resolved_key = (self.auth.api_key.value or "").strip()
@@ -405,20 +584,18 @@ class FoundrySettingsWrite(StrictModel):
             revision += 1
         else:
             resolved_key = current_key
+            if previous_auth_type not in {None, AuthType.API_KEY}:
+                revision += 1
         auth = AuthConfig(type=self.auth.type, api_key=resolved_key)
-        return FoundrySettings.model_validate({
-            "schemaVersion": SCHEMA_VERSION,
-            "endpointKind": self.endpoint_kind,
-            "endpoint": self.endpoint,
-            "model": self.model,
-            "apiType": self.api_type,
-            "versionMode": self.version_mode,
-            "apiVersion": self.api_version,
-            "auth": auth,
-            "agentInstructions": self.agent_instructions,
-            "options": self.options,
-            "credentialRevision": revision,
-        })
+        return FoundrySettings(
+            endpoint_kind=self.endpoint_kind,
+            endpoint=self.endpoint,
+            auth=auth,
+            agent_instructions=self.agent_instructions,
+            api_profiles=self.api_profiles,
+            default_selection=self.default_selection,
+            credential_revision=revision,
+        )
 
 
 def _validate_openai_metadata(value: dict[str, str] | None) -> dict[str, str] | None:
@@ -458,16 +635,14 @@ def normalize_model_endpoint(value: str) -> str:
     cut_points = [position for suffix in ("/openai", "/anthropic") if (position := lowered.find(suffix)) >= 0]
     if cut_points:
         path = path[: min(cut_points)]
-    path = path.rstrip("/")
-    return urlunsplit((scheme, netloc, path, "", ""))
+    return urlunsplit((scheme, netloc, path.rstrip("/"), "", ""))
 
 
-def openai_v1_base_url(settings: FoundrySettings) -> str:
-    base = settings.endpoint.rstrip("/")
-    return f"{base}/openai/v1/"
+def openai_v1_base_url(settings: ResolvedFoundrySettings | FoundrySettings) -> str:
+    return f"{settings.endpoint.rstrip('/')}/openai/v1/"
 
 
-def claude_base_url(settings: FoundrySettings) -> str:
+def claude_base_url(settings: ResolvedFoundrySettings | FoundrySettings) -> str:
     return f"{settings.endpoint.rstrip('/')}/anthropic"
 
 
@@ -478,6 +653,10 @@ def _legacy_number(value: Any, cast: type[int] | type[float]) -> int | float | N
         return cast(value)
     except (TypeError, ValueError):
         return None
+
+
+def migrate_v2_config(data: Mapping[str, Any]) -> FoundrySettings:
+    return FoundrySettings.model_validate(_upgrade_v2_payload(data))
 
 
 def migrate_legacy_config(data: Mapping[str, Any]) -> FoundrySettings | None:
@@ -510,48 +689,65 @@ def migrate_legacy_config(data: Mapping[str, Any]) -> FoundrySettings | None:
                 data.get("max_completion_tokens", data.get("max_tokens", data.get("maxTokens"))), int
             ),
         }
-    options = {key_: value for key_, value in options.items() if value is not None}
+    options = {name: value for name, value in options.items() if value is not None}
     return FoundrySettings.model_validate({
         "schemaVersion": SCHEMA_VERSION,
         "endpointKind": "model",
         "endpoint": endpoint,
-        "model": model,
-        "apiType": api_type.value,
-        "versionMode": version_mode.value,
-        "apiVersion": api_version if version_mode == VersionMode.DATED else None,
         "auth": {"type": "api_key" if key else "entra_id", "apiKey": key},
         "agentInstructions": data.get("system_prompt") or data.get("systemPrompt") or DEFAULT_AGENT_INSTRUCTIONS,
-        "options": options,
+        "apiProfiles": [{
+            "apiType": api_type.value,
+            "models": [model],
+            "defaultModel": model,
+            "versionMode": version_mode.value,
+            "apiVersion": api_version if version_mode == VersionMode.DATED else None,
+            "options": options,
+        }],
+        "defaultSelection": {"apiType": api_type.value, "model": model},
         "credentialRevision": 1 if key else 0,
     })
 
 
 class FoundrySettingsStore:
-    def __init__(self, path: Path, legacy_path: Path | None = None):
+    def __init__(
+        self,
+        path: Path,
+        legacy_path: Path | None = None,
+        protector: SecretProtector | None = None,
+    ):
         self.path = path
         self.legacy_path = legacy_path
+        self.protector = protector or SecretProtector()
 
     def load(self) -> FoundrySettings | None:
         if self.path.exists():
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            return FoundrySettings.model_validate(data)
+            if not isinstance(data, Mapping):
+                raise ValueError("Foundry settings root must be a JSON object.")
+            schema_version = int(data.get("schemaVersion", 2))
+            if schema_version < SCHEMA_VERSION:
+                settings = migrate_v2_config(data)
+                self.save(settings)
+                return settings
+            settings = FoundrySettings.model_validate(self._decrypt_storage_payload(data))
+            self._remove_plaintext_legacy_files()
+            return settings
         if self.legacy_path and self.legacy_path.exists():
             legacy = json.loads(self.legacy_path.read_text(encoding="utf-8"))
+            if not isinstance(legacy, Mapping):
+                raise ValueError("Legacy settings root must be a JSON object.")
             migrated = migrate_legacy_config(legacy)
             if migrated is not None:
-                self._backup_legacy()
                 self.save(migrated)
             return migrated
         return None
 
     def save(self, settings: FoundrySettings) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = json.dumps(settings.storage_dict(), ensure_ascii=False, indent=2)
+        encoded = json.dumps(settings.storage_dict(self.protector), ensure_ascii=False, indent=2)
         descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{self.path.name}.",
-            suffix=".tmp",
-            dir=str(self.path.parent),
-            text=True,
+            prefix=f".{self.path.name}.", suffix=".tmp", dir=str(self.path.parent), text=True
         )
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
@@ -566,40 +762,117 @@ class FoundrySettingsStore:
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+        self._remove_plaintext_legacy_files()
 
     def update(self, payload: FoundrySettingsWrite) -> FoundrySettings:
-        existing = self.load()
+        try:
+            existing = self.load()
+        except (SecretProtectionError, ValidationError, ValueError, TypeError, OSError, json.JSONDecodeError) as exc:
+            can_replace_unreadable_key = (
+                payload.auth.type == AuthType.ENTRA_ID
+                or payload.auth.api_key.action == SecretAction.SET
+            )
+            if not can_replace_unreadable_key:
+                if isinstance(exc, SecretProtectionError):
+                    raise
+                raise SecretProtectionError(
+                    "Stored Foundry settings are invalid or corrupted. Replace the complete settings."
+                ) from exc
+            try:
+                existing = self.load_recoverable_settings()
+            except (ValidationError, ValueError, TypeError, OSError, json.JSONDecodeError):
+                existing = None
         resolved = payload.resolve(existing)
         self.save(resolved)
         return resolved
 
-    def _backup_legacy(self) -> None:
+    def load_recoverable_settings(self) -> FoundrySettings | None:
+        """Recover validated non-secret fields while replacing an unreadable key."""
+        if not self.path.exists():
+            return None
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(data, Mapping):
+            raise ValueError("Foundry settings root must be a JSON object.")
+        if int(data.get("schemaVersion", 0)) != SCHEMA_VERSION:
+            return None
+        mutable = dict(data)
+        auth = dict(mutable.get("auth") or {})
+        auth.pop("apiKeyEncrypted", None)
+        # A placeholder exists only in memory so the complete settings object,
+        # including credentialRevision, can be validated and retained.
+        auth["apiKey"] = "__unreadable_api_key__" if auth.get("type") == AuthType.API_KEY.value else None
+        mutable["auth"] = auth
+        return FoundrySettings.model_validate(mutable)
+
+    def _decrypt_storage_payload(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        mutable = dict(data)
+        auth = dict(mutable.get("auth") or {})
+        if "apiKey" in auth:
+            raise ValueError("Schema v3 settings must not contain a plaintext apiKey.")
+        encrypted = auth.pop("apiKeyEncrypted", None)
+        if auth.get("type") == AuthType.API_KEY.value:
+            if not isinstance(encrypted, Mapping):
+                raise ValueError("Encrypted API key data is required for API key authentication.")
+            context_payload = dict(mutable)
+            context_payload["auth"] = {"type": auth.get("type")}
+            auth["apiKey"] = self.protector.decrypt(
+                encrypted,
+                context=_storage_encryption_context(context_payload),
+            )
+        elif encrypted is not None:
+            raise ValueError("Encrypted API key data must be omitted for Entra ID authentication.")
+        mutable["auth"] = auth
+        return mutable
+
+    def _remove_plaintext_legacy_files(self) -> None:
         if not self.legacy_path:
             return
-        backup = self.legacy_path.with_suffix(self.legacy_path.suffix + ".pre-foundry.bak")
-        if not backup.exists():
-            backup.write_bytes(self.legacy_path.read_bytes())
+        for path in (
+            self.legacy_path,
+            self.legacy_path.with_suffix(self.legacy_path.suffix + ".pre-foundry.bak"),
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise SecretProtectionError(
+                    f"Encrypted settings were saved, but plaintext legacy file '{path.name}' could not be deleted."
+                ) from exc
+
+
+def _storage_encryption_context(payload: Mapping[str, Any]) -> bytes:
+    """Bind ciphertext to every persisted non-secret setting."""
+    context = {key: value for key, value in payload.items() if key != "auth"}
+    context["auth"] = {"type": (payload.get("auth") or {}).get("type")}
+    canonical = json.dumps(context, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return canonical.encode("utf-8")
 
 
 FoundrySettingsAdapter = TypeAdapter(FoundrySettings)
 
 
 __all__ = [
+    "ApiProfile",
     "ApiType",
     "AuthType",
     "ChatCompletionsOptions",
+    "ChatCompletionsProfile",
     "ClaudeMessagesOptions",
+    "ClaudeMessagesProfile",
     "DEFAULT_AGENT_INSTRUCTIONS",
     "EndpointKind",
     "FoundrySettings",
     "FoundrySettingsStore",
     "FoundrySettingsWrite",
+    "ModelSelection",
+    "ResolvedFoundrySettings",
     "ResponsesOptions",
+    "ResponsesProfile",
     "SCHEMA_VERSION",
     "SecretAction",
     "VersionMode",
     "claude_base_url",
     "migrate_legacy_config",
+    "migrate_v2_config",
     "normalize_model_endpoint",
     "normalize_project_endpoint",
     "openai_v1_base_url",

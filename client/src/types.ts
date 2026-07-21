@@ -47,6 +47,7 @@ export interface ChatSession {
   updatedAt: string | Date;
   autoApproveAll?: boolean;
   stateEpoch?: number;
+  selectedModel?: ModelSelection | null;
 }
 
 export interface ResponsesOptions {
@@ -106,30 +107,53 @@ export interface ClaudeMessagesOptions {
 
 export type FoundryOptions = ResponsesOptions | ChatCompletionsOptions | ClaudeMessagesOptions;
 
-export interface FoundrySettings {
-  schemaVersion: 2;
-  endpointKind: EndpointKind;
-  endpoint: string;
-  model: string;
+export interface ModelSelection {
   apiType: ApiType;
+  model: string;
+}
+
+interface ApiProfileBase {
+  models: string[];
+  defaultModel: string;
   versionMode: VersionMode;
   apiVersion?: string;
+}
+
+export interface ResponsesProfile extends ApiProfileBase {
+  apiType: 'responses';
+  options: ResponsesOptions;
+}
+
+export interface ChatCompletionsProfile extends ApiProfileBase {
+  apiType: 'chat_completions';
+  options: ChatCompletionsOptions;
+}
+
+export interface ClaudeMessagesProfile extends ApiProfileBase {
+  apiType: 'claude_messages';
+  options: ClaudeMessagesOptions;
+}
+
+export type ApiProfile = ResponsesProfile | ChatCompletionsProfile | ClaudeMessagesProfile;
+
+export interface FoundrySettings {
+  schemaVersion: 3;
+  endpointKind: EndpointKind;
+  endpoint: string;
   auth: {
     type: AuthType;
     apiKeyConfigured: boolean;
+    apiKeyNeedsReplacement?: boolean;
   };
   agentInstructions: string;
-  options: FoundryOptions;
+  apiProfiles: ApiProfile[];
+  defaultSelection: ModelSelection;
 }
 
 export interface FoundrySettingsWrite {
-  schemaVersion: 2;
+  schemaVersion: 3;
   endpointKind: EndpointKind;
   endpoint: string;
-  model: string;
-  apiType: ApiType;
-  versionMode: VersionMode;
-  apiVersion?: string;
   auth: {
     type: AuthType;
     apiKey: {
@@ -138,7 +162,8 @@ export interface FoundrySettingsWrite {
     };
   };
   agentInstructions: string;
-  options: Record<string, unknown>;
+  apiProfiles: ApiProfile[];
+  defaultSelection: ModelSelection;
 }
 
 export interface SelectedTool {
@@ -161,6 +186,7 @@ export interface ChatEventBase {
 export interface ChatStartedEvent extends ChatEventBase {
   userMessageId: string;
   stateReset: boolean;
+  modelSelection: ModelSelection;
 }
 
 export interface ChatDeltaEvent extends ChatEventBase {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -10,8 +11,9 @@ from typing import Any
 
 import socketio
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
@@ -21,13 +23,15 @@ from app.agent_runtime import (
     ApprovalNotFoundError,
 )
 from app.config import (
+    foundry_settings_store,
     load_foundry_settings,
     update_foundry_settings,
 )
-from app.foundry_config import FoundrySettings, FoundrySettingsWrite
+from app.foundry_config import FoundrySettings, FoundrySettingsWrite, ModelSelection, SCHEMA_VERSION
 from app.mcp_manager import MCPManager, register_callback_result
 from app.saved_servers_manager import SavedServersManager
 from app.session_manager import SessionManager
+from app.secret_protection import SecretProtectionError
 
 logger = logging.getLogger("mcpclient.backend")
 
@@ -36,14 +40,35 @@ saved_servers_manager = SavedServersManager()
 mcp_manager: MCPManager | None = None
 agent_runtime: AgentRuntime | None = None
 foundry_settings: FoundrySettings | None = None
+foundry_settings_error: str | None = None
+recoverable_foundry_settings: FoundrySettings | None = None
 server_statuses: dict[str, dict[str, Any]] = {}
-socket_active_sessions: dict[str, set[str]] = {}
+socket_active_sessions: dict[str, dict[str, str]] = {}
+socket_generations: dict[str, str] = {}
+socket_registry_lock = asyncio.Lock()
+settings_operation_lock = asyncio.Lock()
 
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
-    global mcp_manager, agent_runtime, foundry_settings
-    foundry_settings = load_foundry_settings()
+    global mcp_manager, agent_runtime, foundry_settings, foundry_settings_error, recoverable_foundry_settings
+    try:
+        foundry_settings = load_foundry_settings()
+        foundry_settings_error = None
+        recoverable_foundry_settings = None
+    except (SecretProtectionError, ValidationError, ValueError, TypeError, OSError, json.JSONDecodeError) as exc:
+        foundry_settings = None
+        try:
+            recoverable_foundry_settings = foundry_settings_store.load_recoverable_settings()
+        except (SecretProtectionError, ValidationError, ValueError, TypeError, OSError, json.JSONDecodeError):
+            recoverable_foundry_settings = None
+        foundry_settings_error = (
+            str(exc) if isinstance(exc, SecretProtectionError)
+            else "Microsoft Foundry settings are invalid or corrupted. Replace the complete settings."
+        )
+        logger.error("Microsoft Foundry settings could not be loaded: %s", exc)
+    if foundry_settings:
+        session_manager.reconcile_model_selections(foundry_settings)
     mcp_manager = await MCPManager([]).__aenter__()
     agent_runtime = AgentRuntime(session_manager, mcp_manager)
     try:
@@ -56,6 +81,27 @@ async def app_lifespan(_app: FastAPI):
 
 
 fastapi_app = FastAPI(title="MCP Client for Microsoft Foundry", lifespan=app_lifespan)
+
+
+@fastapi_app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    _request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """Return validation details without echoing secret-bearing request input."""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": [
+                {
+                    key: value
+                    for key, value in error.items()
+                    if key not in {"ctx", "input", "url"}
+                }
+                for error in exc.errors()
+            ]
+        },
+    )
 allowed_origins = [
     origin.strip()
     for origin in os.environ.get("MCPCLIENT_ALLOWED_ORIGINS", "").split(",")
@@ -122,16 +168,23 @@ async def health() -> dict[str, str]:
 
 @sio.event
 async def connect(sid: str, environ: dict[str, Any]) -> None:
-    socket_active_sessions.setdefault(sid, set())
+    async with socket_registry_lock:
+        socket_generations[sid] = str(uuid.uuid4())
+        socket_active_sessions[sid] = {}
     logger.info("Client connected: %s", sid)
 
 
 @sio.event
 async def disconnect(sid: str) -> None:
-    sessions = socket_active_sessions.pop(sid, set())
+    async with socket_registry_lock:
+        socket_generations.pop(sid, None)
+        sessions = socket_active_sessions.pop(sid, {})
     if agent_runtime:
         await asyncio.gather(
-            *(agent_runtime.cancel(session_id) for session_id in sessions),
+            *(
+                agent_runtime.cancel_and_wait(session_id, request_id)
+                for session_id, request_id in sessions.items()
+            ),
             return_exceptions=True,
         )
     logger.info("Client disconnected: %s", sid)
@@ -144,24 +197,51 @@ async def disconnect(sid: str) -> None:
 
 @fastapi_app.get("/foundry-settings/status")
 async def foundry_settings_status() -> dict[str, Any]:
-    return {
+    status = {
         "isConfigured": foundry_settings is not None,
-        "schemaVersion": foundry_settings.schema_version if foundry_settings else 2,
+        "schemaVersion": foundry_settings.schema_version if foundry_settings else SCHEMA_VERSION,
     }
+    if foundry_settings_error:
+        status["error"] = foundry_settings_error
+    if recoverable_foundry_settings:
+        recoverable = recoverable_foundry_settings.public_dict()
+        recoverable["auth"]["apiKeyConfigured"] = False
+        recoverable["auth"]["apiKeyNeedsReplacement"] = True
+        status["recoverableSettings"] = recoverable
+    return status
 
 
 @fastapi_app.get("/foundry-settings")
 async def get_foundry_settings() -> dict[str, Any]:
     if foundry_settings is None:
+        if foundry_settings_error:
+            raise HTTPException(status_code=503, detail=foundry_settings_error)
         raise HTTPException(status_code=404, detail="Microsoft Foundry settings are not configured.")
     return foundry_settings.public_dict()
 
 
 @fastapi_app.put("/foundry-settings")
 async def set_foundry_settings(payload: FoundrySettingsWrite) -> dict[str, Any]:
-    global foundry_settings
+    global foundry_settings, foundry_settings_error, recoverable_foundry_settings
     try:
-        foundry_settings = update_foundry_settings(payload)
+        async with settings_operation_lock:
+            try:
+                existing = foundry_settings or foundry_settings_store.load()
+            except SecretProtectionError:
+                existing = foundry_settings_store.load_recoverable_settings()
+            except (ValidationError, ValueError, TypeError, OSError, json.JSONDecodeError):
+                existing = None
+            candidate = payload.resolve(existing)
+            if agent_runtime:
+                foundry_settings, reconciled = await agent_runtime.apply_settings_update(
+                    candidate,
+                    lambda: update_foundry_settings(payload),
+                )
+            else:
+                foundry_settings = update_foundry_settings(payload)
+                reconciled = session_manager.reconcile_model_selections(foundry_settings)
+    except AgentRunBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValidationError as exc:
         raise HTTPException(
             status_code=422,
@@ -171,8 +251,14 @@ async def set_foundry_settings(payload: FoundrySettingsWrite) -> dict[str, Any]:
                 include_input=False,
             ),
         ) from exc
+    except SecretProtectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    foundry_settings_error = None
+    recoverable_foundry_settings = None
     public = foundry_settings.public_dict()
     await sio.emit("foundrySettingsUpdated", public)
+    for session in reconciled:
+        await sio.emit("sessionUpdated", session)
     return public
 
 
@@ -183,7 +269,8 @@ async def set_foundry_settings(payload: FoundrySettingsWrite) -> dict[str, Any]:
 
 @sio.event
 async def createNewSession(sid: str) -> None:
-    session = session_manager.create(str(uuid.uuid4()))
+    default_selection = foundry_settings.default_selection if foundry_settings else None
+    session = session_manager.create(str(uuid.uuid4()), default_selection)
     await sio.emit("sessionCreated", session, room=sid)
 
 
@@ -219,6 +306,9 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
     data = data if isinstance(data, dict) else {}
     session_id = str(data.get("sessionId") or "")
     request_id = str(data.get("requestId") or uuid.uuid4())
+    connection_generation = socket_generations.get(sid)
+    if connection_generation is None:
+        return
     if foundry_settings is None:
         await sio.emit(
             "chat:error",
@@ -246,11 +336,13 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
 
     message = data.get("message")
     selected_tool_ids = data.get("selectedToolIds", [])
+    selected_model = data.get("selectedModel")
     if (
         not isinstance(message, str)
         or not message.strip()
         or not isinstance(selected_tool_ids, list)
         or any(not isinstance(item, str) for item in selected_tool_ids)
+        or (selected_model is not None and not isinstance(selected_model, dict))
     ):
         await sio.emit(
             "chat:error",
@@ -258,17 +350,104 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
                 request_id=request_id,
                 session_id=session_id,
                 code="InvalidRequest",
-                message="message must be a non-empty string and selectedToolIds must be an array.",
+                message=(
+                    "message must be a non-empty string, selectedToolIds must be an array, "
+                    "and selectedModel must be an object when provided."
+                ),
             ),
             room=sid,
         )
         return
-    if not session_id or session_manager.get_session(session_id) is None:
-        session = session_manager.create()
-        session_id = session["id"]
-        await sio.emit("sessionCreated", session, room=sid)
+    reservation = None
+    created_session: dict[str, Any] | None = None
+    ownership_registered = False
+    disconnected = False
 
-    socket_active_sessions.setdefault(sid, set()).add(session_id)
+    async def unregister_socket_run() -> None:
+        nonlocal ownership_registered
+        if not ownership_registered:
+            return
+        async with socket_registry_lock:
+            active = socket_active_sessions.get(sid)
+            if (
+                socket_generations.get(sid) == connection_generation
+                and active
+                and active.get(session_id) == request_id
+            ):
+                active.pop(session_id, None)
+        ownership_registered = False
+
+    try:
+        async with settings_operation_lock:
+            active_settings = foundry_settings
+            if active_settings is None:
+                raise ValueError("Microsoft Foundry settings are not configured.")
+            existing_session = session_manager.get_session(session_id) if session_id else None
+            if existing_session is not None:
+                reservation = await agent_runtime.reserve_run(session_id, request_id)
+                selection_value = selected_model if selected_model is not None else (
+                    existing_session.get("selectedModel") or active_settings.default_selection
+                )
+                try:
+                    selection = ModelSelection.model_validate(selection_value)
+                    runtime_settings = active_settings.resolve(selection)
+                except (ValidationError, ValueError, KeyError):
+                    await agent_runtime.release_run(reservation)
+                    reservation = None
+                    raise
+            else:
+                selection_value = selected_model if selected_model is not None else active_settings.default_selection
+                selection = ModelSelection.model_validate(selection_value)
+                runtime_settings = active_settings.resolve(selection)
+                session_id = str(uuid.uuid4())
+                reservation = await agent_runtime.reserve_run(session_id, request_id)
+            async with socket_registry_lock:
+                if socket_generations.get(sid) != connection_generation:
+                    disconnected = True
+                else:
+                    socket_active_sessions[sid][session_id] = request_id
+                    ownership_registered = True
+            if disconnected:
+                await agent_runtime.release_run(reservation)
+                reservation = None
+            elif existing_session is None:
+                created_session = session_manager.create(session_id, selection)
+    except AgentRunBusyError as exc:
+        current = session_manager.get_public_session(session_id)
+        await sio.emit(
+            "chat:error",
+            _chat_error_payload(
+                request_id=request_id,
+                session_id=session_id,
+                code="RunBusy",
+                message=str(exc),
+                session=current,
+            ),
+            room=sid,
+        )
+        return
+    except (ValidationError, ValueError, KeyError) as exc:
+        await sio.emit(
+            "chat:error",
+            _chat_error_payload(
+                request_id=request_id,
+                session_id=session_id,
+                code="InvalidModelSelection",
+                message=str(exc),
+            ),
+            room=sid,
+        )
+        return
+    except BaseException:
+        await unregister_socket_run()
+        if reservation is not None:
+            await agent_runtime.release_run(reservation)
+        raise
+    if disconnected:
+        return
+    if reservation is None:
+        raise RuntimeError("Agent run reservation was not created.")
+
     terminal_emitted = False
     latest_event: dict[str, Any] = {}
 
@@ -284,18 +463,22 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
                 await sio.emit("sessionUpdated", current)
 
     try:
+        if created_session is not None:
+            await sio.emit("sessionCreated", created_session, room=sid)
         await agent_runtime.run(
             session_id=session_id,
             message=message,
             selected_tool_ids=selected_tool_ids,
-            settings=foundry_settings,
+            settings=runtime_settings,
             emit=emit,
             request_id=request_id,
+            reservation=reservation,
         )
         current = session_manager.get_public_session(session_id)
         if current:
             await sio.emit("sessionUpdated", current)
     except AgentRunBusyError as exc:
+        current = session_manager.get_public_session(session_id)
         await sio.emit(
             "chat:error",
             _chat_error_payload(
@@ -303,6 +486,7 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
                 session_id=session_id,
                 code="RunBusy",
                 message=str(exc),
+                session=current,
             ),
             room=sid,
         )
@@ -344,7 +528,40 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
         if current:
             await sio.emit("sessionUpdated", current)
     finally:
-        socket_active_sessions.get(sid, set()).discard(session_id)
+        await agent_runtime.release_run(reservation)
+        await unregister_socket_run()
+
+
+@sio.event
+async def setSessionModel(sid: str, data: dict[str, Any]) -> None:
+    data = data if isinstance(data, dict) else {}
+    session_id = str(data.get("sessionId") or "")
+    selection_value = data.get("selectedModel")
+    if foundry_settings is None:
+        await sio.emit("error", {"message": "Microsoft Foundry settings are not configured."}, room=sid)
+        return
+    if session_manager.get_session(session_id) is None:
+        await sio.emit("error", {"message": "Session not found."}, room=sid)
+        return
+    try:
+        selection = ModelSelection.model_validate(selection_value)
+        foundry_settings.resolve(selection)
+    except (ValidationError, ValueError, KeyError) as exc:
+        await sio.emit("error", {"message": str(exc)}, room=sid)
+        return
+    try:
+        updated = (
+            await agent_runtime.set_selected_model(session_id, selection)
+            if agent_runtime
+            else session_manager.set_selected_model(session_id, selection)
+        )
+    except AgentRunBusyError:
+        await sio.emit("error", {"message": "The model cannot be changed while a run is active."}, room=sid)
+        current = session_manager.get_public_session(session_id)
+        if current:
+            await sio.emit("sessionUpdated", current, room=sid)
+        return
+    await sio.emit("sessionUpdated", updated)
 
 
 @sio.on("chat:cancel")

@@ -27,6 +27,9 @@ def test_windows_specs_produce_onefile_and_compatibility_onedir():
         assert "'agent_framework_openai'" in source
         assert "name.lower() == 'ucrtbase.dll'" in source
         assert "name.lower().startswith('api-ms-win-')" in source
+        assert "'keyring'" in source
+        assert "'cryptography'" in source
+        assert "'keyring.backends.Windows'" in source
 
     assert "onefile=True" in onefile
     assert "COLLECT(" not in onefile
@@ -40,6 +43,7 @@ def test_macos_bundle_uses_three_part_short_and_four_part_build_versions():
     assert "SHORT_VERSION = '.'.join(VERSION.split('.')[:3])" in source
     assert "'CFBundleShortVersionString': SHORT_VERSION" in source
     assert "'CFBundleVersion': VERSION" in source
+    assert "'keyring.backends.macOS'" in source
 
 
 def test_windowed_smoke_writes_traceback_instead_of_showing_unreadable_modal():
@@ -49,6 +53,12 @@ def test_windowed_smoke_writes_traceback_instead_of_showing_unreadable_modal():
     assert "MCPCLIENT_SMOKE_REPORT" in source
     assert "traceback.format_exc()" in source
     assert "os._exit(1)" in source
+    assert "SecretProtector" in source
+    assert "import keyring" in source
+    assert 'encrypt("package-smoke")' in source
+    assert "set_password(_smoke_service" in source
+    assert "get_password(_smoke_service" in source
+    assert "delete_password(_smoke_service" in source
 
     runner = read("scripts/smoke_package.py")
     assert '"taskkill", "/PID"' in runner
@@ -108,6 +118,19 @@ def test_windows_packager_validates_archive_roots_and_checksums():
 def test_docker_and_ci_use_supported_node_lts():
     assert "FROM node:24-bookworm-slim" in read("Dockerfile")
     assert "node-version: '24'" in read(".github/workflows/ci.yml")
+
+
+def test_secret_protection_dependencies_and_container_contract_are_explicit():
+    assert "cryptography==49.0.0" in read("requirements.txt")
+    assert "keyring==25.7.0" in read("requirements-desktop.txt")
+    dockerfile = read("Dockerfile")
+    assert "MCPCLIENT_ENCRYPTION_KEY" in dockerfile
+    assert "Never bake it" in dockerfile
+    workflow = read(".github/workflows/container-release.yml")
+    assert "smoke_container_encryption.py" in workflow
+    assert "/app/smoke.py" in workflow
+    assert "unexpectedly loaded without MCPCLIENT_ENCRYPTION_KEY" in workflow
+    assert "unexpectedly loaded with a different key" in workflow
 
 
 def test_release_uses_version_source_once_and_publishes_checksums():

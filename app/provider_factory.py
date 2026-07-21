@@ -19,6 +19,7 @@ from app.foundry_config import (
     AuthType,
     EndpointKind,
     FoundrySettings,
+    ResolvedFoundrySettings,
     VersionMode,
     claude_base_url,
     openai_v1_base_url,
@@ -26,7 +27,8 @@ from app.foundry_config import (
 
 AzureScope = Literal["https://ai.azure.com/.default", "https://cognitiveservices.azure.com/.default"]
 CredentialFactory = Callable[[], Any]
-HttpClientFactory = Callable[[FoundrySettings, "RouteDescriptor"], httpx.AsyncClient]
+SettingsSnapshot = FoundrySettings | ResolvedFoundrySettings
+HttpClientFactory = Callable[[ResolvedFoundrySettings, "RouteDescriptor"], httpx.AsyncClient]
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +86,12 @@ class ProviderFactory:
         )
         self._http_client_factory = http_client_factory
 
-    def describe_route(self, settings: FoundrySettings) -> RouteDescriptor:
+    @staticmethod
+    def _resolve(settings: SettingsSnapshot) -> ResolvedFoundrySettings:
+        return settings.resolve() if isinstance(settings, FoundrySettings) else settings
+
+    def describe_route(self, settings: SettingsSnapshot) -> RouteDescriptor:
+        settings = self._resolve(settings)
         auth_header: Literal["Authorization", "api-key"]
         auth_header = "api-key" if settings.auth.type == AuthType.API_KEY else "Authorization"
         if settings.endpoint_kind == EndpointKind.PROJECT:
@@ -130,7 +137,8 @@ class ProviderFactory:
             expected_auth_header=auth_header,
         )
 
-    def create(self, settings: FoundrySettings) -> ProviderBundle:
+    def create(self, settings: SettingsSnapshot) -> ProviderBundle:
+        settings = self._resolve(settings)
         route = self.describe_route(settings)
         if settings.endpoint_kind == EndpointKind.PROJECT:
             credential = self._credential_factory()

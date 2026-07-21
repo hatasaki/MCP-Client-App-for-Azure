@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Box,
@@ -19,19 +19,28 @@ import {
 } from '@mui/material';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 
+import DeploymentRows, { deploymentsToRows, rowsToDeployments } from './DeploymentRows';
 import KeyValueRows, { KeyValueRow, recordToRows, rowsToRecord } from './KeyValueRows';
 import {
+  ApiProfile,
   ApiType,
   AuthType,
   EndpointKind,
   FoundrySettings,
   FoundrySettingsWrite,
+  ModelSelection,
   SecretAction,
   VersionMode,
 } from '../types';
 
 const DEFAULT_INSTRUCTIONS =
   "Based on the user's instructions, analyze the user's intent, define goals to achieve that intent, invoke and execute necessary tools until the goals are accomplished, and finally return the response to the user.";
+const API_TYPES: ApiType[] = ['responses', 'chat_completions', 'claude_messages'];
+const API_LABELS: Record<ApiType, string> = {
+  responses: 'Responses',
+  chat_completions: 'Chat Completions',
+  claude_messages: 'Claude Messages',
+};
 
 interface FoundryConfigDialogProps {
   open: boolean;
@@ -40,35 +49,84 @@ interface FoundryConfigDialogProps {
   initialConfig?: FoundrySettings | null;
 }
 
-interface FormState {
+interface CommonFormState {
   endpointKind: EndpointKind;
   endpoint: string;
-  model: string;
-  apiType: ApiType;
-  versionMode: VersionMode;
-  apiVersion: string;
   authType: AuthType;
   apiKeyConfigured: boolean;
   secretAction: SecretAction;
   apiKeyValue: string;
   agentInstructions: string;
-  options: Record<string, any>;
 }
 
-const defaultForm = (): FormState => ({
+interface ProfileFormState {
+  apiType: ApiType;
+  modelRows: string[];
+  defaultModel: string;
+  versionMode: VersionMode;
+  apiVersion: string;
+  options: Record<string, any>;
+  metadataRows: KeyValueRow[];
+}
+
+type ProfileForms = Record<ApiType, ProfileFormState>;
+
+const defaultCommon = (): CommonFormState => ({
   endpointKind: 'project',
   endpoint: '',
-  model: '',
-  apiType: 'responses',
-  versionMode: 'v1',
-  apiVersion: '',
   authType: 'entra_id',
   apiKeyConfigured: false,
   secretAction: 'keep',
   apiKeyValue: '',
   agentInstructions: DEFAULT_INSTRUCTIONS,
-  options: {},
 });
+
+const defaultProfile = (apiType: ApiType): ProfileFormState => ({
+  apiType,
+  modelRows: deploymentsToRows(),
+  defaultModel: '',
+  versionMode: apiType === 'claude_messages' ? 'provider' : 'v1',
+  apiVersion: '',
+  options: apiType === 'claude_messages' ? { maxTokens: 4096 } : {},
+  metadataRows: recordToRows(),
+});
+
+const normalizeOptionsForForm = (profile: ApiProfile): Record<string, any> => {
+  const options = { ...(profile.options as Record<string, any>) };
+  if (Array.isArray(options.stop)) options.stop = options.stop.join(', ');
+  if (Array.isArray(options.stopSequences)) options.stopSequences = options.stopSequences.join(', ');
+  if (options.thinking) {
+    options.thinkingType = options.thinking.type;
+    if (options.thinking.type === 'enabled') {
+      options.thinkingBudgetTokens = options.thinking.budgetTokens;
+    }
+    delete options.thinking;
+  }
+  return options;
+};
+
+const hydrateProfiles = (initial?: FoundrySettings | null): ProfileForms => Object.fromEntries(
+  API_TYPES.map((apiType) => {
+    const persisted = initial?.apiProfiles.find((profile) => profile.apiType === apiType);
+    if (!persisted) return [apiType, defaultProfile(apiType)];
+    const options = normalizeOptionsForForm(persisted);
+    return [apiType, {
+      apiType,
+      modelRows: deploymentsToRows(persisted.models),
+      defaultModel: persisted.defaultModel,
+      versionMode: persisted.versionMode,
+      apiVersion: persisted.apiVersion || '',
+      options,
+      metadataRows: recordToRows(options.metadata),
+    } satisfies ProfileFormState];
+  })
+) as ProfileForms;
+
+const selectionKey = (selection: ModelSelection): string => JSON.stringify([selection.apiType, selection.model]);
+const parseSelectionKey = (value: string): ModelSelection => {
+  const [apiType, model] = JSON.parse(value) as [ApiType, string];
+  return { apiType, model };
+};
 
 const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
   open,
@@ -76,136 +134,117 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
   onSave,
   initialConfig,
 }) => {
-  const [form, setForm] = useState<FormState>(defaultForm);
-  const [metadataRows, setMetadataRows] = useState<KeyValueRow[]>(recordToRows());
+  const [common, setCommon] = useState<CommonFormState>(defaultCommon);
+  const [profiles, setProfiles] = useState<ProfileForms>(() => hydrateProfiles());
+  const [activeApiType, setActiveApiType] = useState<ApiType>('responses');
+  const [defaultModelKey, setDefaultModelKey] = useState('');
   const [formError, setFormError] = useState('');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     if (initialConfig) {
-      const options = { ...(initialConfig.options as Record<string, any>) };
-      if (Array.isArray(options.stop)) options.stop = options.stop.join(', ');
-      if (Array.isArray(options.stopSequences)) options.stopSequences = options.stopSequences.join(', ');
-      if (options.thinking) {
-        options.thinkingType = options.thinking.type;
-        if (options.thinking.type === 'enabled') {
-          options.thinkingBudgetTokens = options.thinking.budgetTokens;
-        }
-        delete options.thinking;
-      }
-      setForm({
+      setCommon({
         endpointKind: initialConfig.endpointKind,
         endpoint: initialConfig.endpoint,
-        model: initialConfig.model,
-        apiType: initialConfig.apiType,
-        versionMode: initialConfig.versionMode,
-        apiVersion: initialConfig.apiVersion || '',
         authType: initialConfig.auth.type,
         apiKeyConfigured: initialConfig.auth.apiKeyConfigured,
-        secretAction: 'keep',
+        secretAction: initialConfig.auth.apiKeyConfigured
+          ? 'keep'
+          : initialConfig.auth.type === 'api_key' ? 'set' : 'clear',
         apiKeyValue: '',
         agentInstructions: initialConfig.agentInstructions,
-        options,
       });
-      setMetadataRows(recordToRows(options.metadata));
+      setProfiles(hydrateProfiles(initialConfig));
+      setActiveApiType(initialConfig.defaultSelection.apiType);
+      setDefaultModelKey(selectionKey(initialConfig.defaultSelection));
     } else {
-      setForm(defaultForm());
-      setMetadataRows(recordToRows());
+      setCommon(defaultCommon());
+      setProfiles(hydrateProfiles());
+      setActiveApiType('responses');
+      setDefaultModelKey('');
     }
     setFormError('');
   }, [open, initialConfig]);
 
-  const setBase = <K extends keyof FormState>(key: K, value: FormState[K]) => {
-    setForm((current) => ({ ...current, [key]: value }));
+  const activeProfile = profiles[activeApiType];
+  const activeModels = rowsToDeployments(activeProfile.modelRows);
+
+  const availableSelections = useMemo(() => API_TYPES.flatMap((apiType) => {
+    if (common.endpointKind === 'project' && apiType !== 'responses') return [];
+    return rowsToDeployments(profiles[apiType].modelRows).map((model) => ({ apiType, model }));
+  }), [common.endpointKind, profiles]);
+
+  const setCommonField = <K extends keyof CommonFormState>(key: K, value: CommonFormState[K]) => {
+    setCommon((current) => ({ ...current, [key]: value }));
+  };
+
+  const updateActiveProfile = (updates: Partial<ProfileFormState>) => {
+    setProfiles((current) => ({
+      ...current,
+      [activeApiType]: { ...current[activeApiType], ...updates },
+    }));
   };
 
   const setOption = (key: string, value: unknown) => {
-    setForm((current) => {
-      const options = { ...current.options };
-      if (value === '' || value === undefined || value === null) delete options[key];
-      else options[key] = value;
-      return { ...current, options };
-    });
+    const options = { ...activeProfile.options };
+    if (value === '' || value === undefined || value === null) delete options[key];
+    else options[key] = value;
+    updateActiveProfile({ options });
   };
 
   const changeEndpointKind = (kind: EndpointKind) => {
-    if (kind === 'project') {
-      setForm((current) => ({
-        ...current,
-        endpointKind: kind,
-        apiType: 'responses',
-        versionMode: 'v1',
-        apiVersion: '',
-        authType: 'entra_id',
-        secretAction: 'clear',
+    setCommon((current) => ({
+      ...current,
+      endpointKind: kind,
+      ...(kind === 'project' ? {
+        authType: 'entra_id' as const,
+        secretAction: 'clear' as const,
         apiKeyValue: '',
-        options: current.apiType === 'responses' ? current.options : {},
+      } : {}),
+    }));
+    if (kind === 'project') {
+      setProfiles((current) => ({
+        ...current,
+        responses: {
+          ...current.responses,
+          versionMode: 'v1',
+          apiVersion: '',
+        },
       }));
-    } else {
-      setForm((current) => ({ ...current, endpointKind: kind }));
+      setActiveApiType('responses');
+      const responseModels = rowsToDeployments(profiles.responses.modelRows);
+      if (responseModels.length) {
+        setDefaultModelKey(selectionKey({ apiType: 'responses', model: profiles.responses.defaultModel || responseModels[0] }));
+      }
     }
   };
 
-  const changeApiType = (apiType: ApiType) => {
-    setForm((current) => ({
-      ...current,
-      apiType,
-      versionMode: apiType === 'claude_messages' ? 'provider' : 'v1',
-      apiVersion: '',
-      options: apiType === 'claude_messages' ? { maxTokens: 4096 } : {},
-    }));
-    setMetadataRows(recordToRows());
-  };
-
   const changeAuthType = (authType: AuthType) => {
-    setForm((current) => ({
+    setCommon((current) => ({
       ...current,
       authType,
-      secretAction:
-        authType === 'api_key' ? (current.apiKeyConfigured ? 'keep' : 'set') : 'clear',
+      secretAction: authType === 'api_key' ? (current.apiKeyConfigured ? 'keep' : 'set') : 'clear',
       apiKeyValue: '',
     }));
   };
 
-  const validateRows = (rows: KeyValueRow[]): string | null => {
+  const validateRows = (rows: KeyValueRow[], apiType: ApiType): string | null => {
     const active = rows.filter((row) => row.key || row.value);
-    if (active.some((row) => !row.key.trim())) return 'Metadata keys are required.';
+    if (active.some((row) => !row.key.trim())) return `${apiType}: metadata keys are required.`;
     const keys = active.map((row) => row.key.trim());
-    if (new Set(keys).size !== keys.length) return 'Metadata keys must be unique.';
+    if (new Set(keys).size !== keys.length) return `${apiType}: metadata keys must be unique.`;
     return null;
   };
 
-  const handleSave = async () => {
-    if (!form.endpoint.trim() || !form.model.trim()) {
-      setFormError('Endpoint and model deployment name are required.');
-      return;
-    }
-    if (form.versionMode === 'dated' && !form.apiVersion.trim()) {
-      setFormError('A dated API version is required.');
-      return;
-    }
-    if (form.authType === 'api_key' && form.secretAction === 'set' && !form.apiKeyValue.trim()) {
-      setFormError('Enter an API key or choose Entra ID authentication.');
-      return;
-    }
-    if (form.apiType === 'claude_messages' && !(Number(form.options.maxTokens) > 0)) {
-      setFormError('Claude max_tokens is required and must be greater than zero.');
-      return;
-    }
-    const rowError = validateRows(metadataRows);
-    if (rowError) {
-      setFormError(rowError);
-      return;
-    }
-
-    const options = { ...form.options };
-    if (form.apiType === 'chat_completions' && typeof options.stop === 'string') {
+  const prepareOptions = (profile: ProfileFormState): Record<string, unknown> => {
+    const options = { ...profile.options };
+    if (profile.apiType === 'chat_completions' && typeof options.stop === 'string') {
       const stop = options.stop.split(',').map((item: string) => item.trim()).filter(Boolean);
       if (stop.length) options.stop = stop;
       else delete options.stop;
     }
-    if (form.apiType === 'claude_messages') {
+    if (profile.apiType === 'claude_messages') {
       if (typeof options.stopSequences === 'string') {
         const stopSequences = options.stopSequences
           .split(',')
@@ -218,34 +257,87 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
       const thinkingBudgetTokens = options.thinkingBudgetTokens;
       delete options.thinkingType;
       delete options.thinkingBudgetTokens;
-      if (thinkingType === 'enabled') {
-        options.thinking = { type: 'enabled', budgetTokens: thinkingBudgetTokens };
-      } else if (thinkingType === 'disabled' || thinkingType === 'adaptive') {
-        options.thinking = { type: thinkingType };
-      }
+      if (thinkingType === 'enabled') options.thinking = { type: 'enabled', budgetTokens: thinkingBudgetTokens };
+      else if (thinkingType === 'disabled' || thinkingType === 'adaptive') options.thinking = { type: thinkingType };
     }
-    const metadata = rowsToRecord(metadataRows);
+    const metadata = rowsToRecord(profile.metadataRows);
     if (Object.keys(metadata).length) options.metadata = metadata;
     else delete options.metadata;
+    return options;
+  };
+
+  const handleSave = async () => {
+    if (!common.endpoint.trim()) {
+      setFormError('Endpoint is required.');
+      return;
+    }
+    if (common.authType === 'api_key' && common.secretAction === 'set' && !common.apiKeyValue.trim()) {
+      setFormError('Enter an API key or choose Entra ID authentication.');
+      return;
+    }
+
+    const enabledApiTypes = API_TYPES.filter((apiType) => (
+      common.endpointKind !== 'project' || apiType === 'responses'
+    ) && rowsToDeployments(profiles[apiType].modelRows).length > 0);
+    if (!enabledApiTypes.length) {
+      setFormError('Configure at least one model deployment.');
+      return;
+    }
+
+    const apiProfiles: ApiProfile[] = [];
+    for (const apiType of enabledApiTypes) {
+      const profile = profiles[apiType];
+      const models = rowsToDeployments(profile.modelRows);
+      if (models.length !== new Set(models).size) {
+        setFormError(`${apiType}: model deployment names must be unique.`);
+        return;
+      }
+      const defaultModel = models.includes(profile.defaultModel) ? profile.defaultModel : models[0];
+      if (profile.versionMode === 'dated' && !profile.apiVersion.trim()) {
+        setFormError(`${apiType}: a dated API version is required.`);
+        return;
+      }
+      if (apiType === 'claude_messages' && !(Number(profile.options.maxTokens) > 0)) {
+        setFormError('Claude max_tokens is required and must be greater than zero.');
+        return;
+      }
+      const rowError = validateRows(profile.metadataRows, apiType);
+      if (rowError) {
+        setFormError(rowError);
+        return;
+      }
+      apiProfiles.push({
+        apiType,
+        models,
+        defaultModel,
+        versionMode: profile.versionMode,
+        ...(profile.versionMode === 'dated' ? { apiVersion: profile.apiVersion.trim() } : {}),
+        options: prepareOptions(profile),
+      } as ApiProfile);
+    }
+
+    const selections = apiProfiles.flatMap((profile) => profile.models.map((model) => ({ apiType: profile.apiType, model })));
+    const configuredKeys = new Set(selections.map(selectionKey));
+    const defaultSelection = defaultModelKey && configuredKeys.has(defaultModelKey)
+      ? parseSelectionKey(defaultModelKey)
+      : selections[0];
 
     const payload: FoundrySettingsWrite = {
-      schemaVersion: 2,
-      endpointKind: form.endpointKind,
-      endpoint: form.endpoint.trim(),
-      model: form.model.trim(),
-      apiType: form.apiType,
-      versionMode: form.versionMode,
-      ...(form.versionMode === 'dated' ? { apiVersion: form.apiVersion.trim() } : {}),
+      schemaVersion: 3,
+      endpointKind: common.endpointKind,
+      endpoint: common.endpoint.trim(),
       auth: {
-        type: form.authType,
+        type: common.authType,
         apiKey: {
-          action: form.authType === 'entra_id' ? 'clear' : form.secretAction,
-          ...(form.secretAction === 'set' ? { value: form.apiKeyValue } : {}),
+          action: common.authType === 'entra_id' ? 'clear' : common.secretAction,
+          ...(common.secretAction === 'set' ? { value: common.apiKeyValue } : {}),
         },
       },
-      agentInstructions: form.agentInstructions,
-      options,
+      agentInstructions: common.agentInstructions,
+      apiProfiles,
+      defaultSelection,
     };
+
     setSaving(true);
     setFormError('');
     try {
@@ -266,7 +358,7 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
     <TextField
       label={label}
       type="number"
-      value={form.options[key] ?? ''}
+      value={activeProfile.options[key] ?? ''}
       onChange={(event) => setOption(key, event.target.value === '' ? undefined : Number(event.target.value))}
       inputProps={constraints}
       helperText="Leave empty to omit."
@@ -277,7 +369,7 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
   const textField = (label: string, key: string, helper = 'Leave empty to omit.') => (
     <TextField
       label={label}
-      value={form.options[key] ?? ''}
+      value={activeProfile.options[key] ?? ''}
       onChange={(event) => setOption(key, event.target.value || undefined)}
       helperText={helper}
       fullWidth
@@ -288,7 +380,7 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
     <TextField
       select
       label={label}
-      value={form.options[key] ?? ''}
+      value={activeProfile.options[key] ?? ''}
       onChange={(event) => setOption(key, event.target.value || undefined)}
       helperText="Omit uses the service/model default."
       fullWidth
@@ -305,11 +397,8 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
     <TextField
       select
       label={label}
-      value={form.options[key] === undefined ? '' : String(form.options[key])}
-      onChange={(event) => setOption(
-        key,
-        event.target.value === '' ? undefined : event.target.value === 'true'
-      )}
+      value={activeProfile.options[key] === undefined ? '' : String(activeProfile.options[key])}
+      onChange={(event) => setOption(key, event.target.value === '' ? undefined : event.target.value === 'true')}
       helperText="Omit, true, and false are distinct values."
       fullWidth
     >
@@ -328,14 +417,14 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
           <TextField
             select
             label="Endpoint kind"
-            value={form.endpointKind}
+            value={common.endpointKind}
             onChange={(event) => changeEndpointKind(event.target.value as EndpointKind)}
           >
             <MenuItem value="project">Foundry Project endpoint</MenuItem>
             <MenuItem value="model">Model endpoint</MenuItem>
           </TextField>
 
-          {form.endpointKind === 'project' && (
+          {common.endpointKind === 'project' && (
             <Alert
               severity="info"
               icon={
@@ -346,27 +435,20 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
                 </Tooltip>
               }
             >
-              Project endpoints use Entra ID with MAF <code>FoundryChatClient</code>. To use a resource API key,
-              select <strong>Model endpoint</strong>. Model endpoints do not expose Project-scoped connections or
-              platform capabilities.
+              Project endpoints use Entra ID and Responses API only. Multiple Responses model deployments can be configured.
+              To use a resource API key, select <strong>Model endpoint</strong>.
             </Alert>
           )}
 
           <TextField
-            label={form.endpointKind === 'project' ? 'Project endpoint' : 'Model resource endpoint'}
-            value={form.endpoint}
-            onChange={(event) => setBase('endpoint', event.target.value)}
+            label={common.endpointKind === 'project' ? 'Project endpoint' : 'Model resource endpoint'}
+            value={common.endpoint}
+            onChange={(event) => setCommonField('endpoint', event.target.value)}
             placeholder={
-              form.endpointKind === 'project'
+              common.endpointKind === 'project'
                 ? 'https://resource.services.ai.azure.com/api/projects/project-name'
                 : 'https://resource.services.ai.azure.com'
             }
-            required
-          />
-          <TextField
-            label="Model deployment name"
-            value={form.model}
-            onChange={(event) => setBase('model', event.target.value)}
             required
           />
 
@@ -376,9 +458,9 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
               id="foundry-api"
               labelId="foundry-api-label"
               label="API"
-              value={form.apiType}
-              disabled={form.endpointKind === 'project'}
-              onChange={(event) => changeApiType(event.target.value as ApiType)}
+              value={activeApiType}
+              disabled={common.endpointKind === 'project'}
+              onChange={(event) => setActiveApiType(event.target.value as ApiType)}
             >
               <MenuItem value="responses">Responses</MenuItem>
               <MenuItem value="chat_completions">Chat Completions</MenuItem>
@@ -386,95 +468,58 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
             </Select>
           </FormControl>
 
-          {form.endpointKind === 'model' && form.apiType !== 'claude_messages' && (
+          <Typography variant="subtitle1">Model deployments for {API_LABELS[activeApiType]}</Typography>
+          <DeploymentRows
+            rows={activeProfile.modelRows}
+            onChange={(modelRows) => {
+              const models = rowsToDeployments(modelRows);
+              updateActiveProfile({
+                modelRows,
+                defaultModel: models.includes(activeProfile.defaultModel) ? activeProfile.defaultModel : (models[0] || ''),
+              });
+            }}
+          />
+          <TextField
+            select
+            label="Default model for this API"
+            value={activeModels.includes(activeProfile.defaultModel) ? activeProfile.defaultModel : (activeModels[0] || '')}
+            onChange={(event) => updateActiveProfile({ defaultModel: event.target.value })}
+            disabled={!activeModels.length}
+            helperText="Used when this API profile is selected as the default for a new chat."
+          >
+            {activeModels.map((model) => <MenuItem key={model} value={model}>{model}</MenuItem>)}
+          </TextField>
+
+          {common.endpointKind === 'model' && activeApiType !== 'claude_messages' && (
             <TextField
               select
               label="API version mode"
-              value={form.versionMode}
+              value={activeProfile.versionMode}
               onChange={(event) => {
-                const value = event.target.value as VersionMode;
-                setBase('versionMode', value);
-                if (value === 'v1') setBase('apiVersion', '');
+                const versionMode = event.target.value as VersionMode;
+                updateActiveProfile({ versionMode, ...(versionMode === 'v1' ? { apiVersion: '' } : {}) });
               }}
             >
               <MenuItem value="v1">v1</MenuItem>
               <MenuItem value="dated">Dated API version</MenuItem>
             </TextField>
           )}
-          {form.versionMode === 'dated' && (
+          {activeProfile.versionMode === 'dated' && (
             <TextField
               label="API version"
-              value={form.apiVersion}
-              onChange={(event) => setBase('apiVersion', event.target.value)}
+              value={activeProfile.apiVersion}
+              onChange={(event) => updateActiveProfile({ apiVersion: event.target.value })}
               placeholder="2025-04-01-preview"
               required
             />
           )}
 
-          <FormControl fullWidth>
-            <InputLabel id="foundry-auth-label">Authentication</InputLabel>
-            <Select
-              id="foundry-auth"
-              labelId="foundry-auth-label"
-              label="Authentication"
-              value={form.authType}
-              disabled={form.endpointKind === 'project'}
-              onChange={(event) => changeAuthType(event.target.value as AuthType)}
-            >
-              <MenuItem value="entra_id">Microsoft Entra ID</MenuItem>
-              <MenuItem value="api_key">API key</MenuItem>
-            </Select>
-          </FormControl>
-
-          {form.authType === 'api_key' && (
-            <>
-              <TextField
-                select
-                label="API key action"
-                value={form.secretAction}
-                onChange={(event) => {
-                  const action = event.target.value as SecretAction;
-                  if (action === 'clear') {
-                    setForm((current) => ({
-                      ...current,
-                      authType: 'entra_id',
-                      secretAction: 'clear',
-                      apiKeyValue: '',
-                    }));
-                  } else {
-                    setBase('secretAction', action);
-                  }
-                }}
-              >
-                {form.apiKeyConfigured && <MenuItem value="keep">Keep configured key</MenuItem>}
-                <MenuItem value="set">{form.apiKeyConfigured ? 'Replace key' : 'Set key'}</MenuItem>
-                {form.apiKeyConfigured && <MenuItem value="clear">Clear key and use Entra ID</MenuItem>}
-              </TextField>
-              {form.secretAction === 'set' && (
-                <TextField
-                  label="API key"
-                  type="password"
-                  value={form.apiKeyValue}
-                  onChange={(event) => setBase('apiKeyValue', event.target.value)}
-                  autoComplete="new-password"
-                  required
-                />
-              )}
-            </>
-          )}
-
-          <TextField
-            label="Agent Instructions"
-            value={form.agentInstructions}
-            onChange={(event) => setBase('agentInstructions', event.target.value)}
-            multiline
-            minRows={4}
-          />
-
           <Divider />
-          <Typography variant="h6">{form.apiType === 'responses' ? 'Responses' : form.apiType === 'chat_completions' ? 'Chat Completions' : 'Claude Messages'} parameters</Typography>
+          <Typography variant="h6">
+            {activeApiType === 'responses' ? 'Responses' : activeApiType === 'chat_completions' ? 'Chat Completions' : 'Claude Messages'} parameters
+          </Typography>
 
-          {form.apiType === 'responses' && (
+          {activeApiType === 'responses' && (
             <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 2 }}>
               {numberField('temperature', 'temperature', { min: 0, max: 2, step: 0.1 })}
               {numberField('top_p', 'topP', { min: 0, max: 1, step: 0.05 })}
@@ -492,7 +537,7 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
             </Box>
           )}
 
-          {form.apiType === 'chat_completions' && (
+          {activeApiType === 'chat_completions' && (
             <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 2 }}>
               {numberField('temperature', 'temperature', { min: 0, max: 2, step: 0.1 })}
               {numberField('top_p', 'topP', { min: 0, max: 1, step: 0.05 })}
@@ -513,7 +558,7 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
             </Box>
           )}
 
-          {form.apiType === 'claude_messages' && (
+          {activeApiType === 'claude_messages' && (
             <>
               <Alert severity="warning">
                 The MAF Anthropic connector is currently beta. Claude <code>max_tokens</code> is required and cannot be omitted.
@@ -529,17 +574,101 @@ const FoundryConfigDialog: React.FC<FoundryConfigDialogProps> = ({
                 {booleanField('parallel tool use', 'parallelToolUse')}
                 {textField('metadata.user_id', 'metadataUserId')}
                 {enumField('thinking.type', 'thinkingType', ['disabled', 'enabled', 'adaptive'])}
-                {form.options.thinkingType === 'enabled' && numberField('thinking.budget_tokens', 'thinkingBudgetTokens', { min: 1 })}
+                {activeProfile.options.thinkingType === 'enabled' && numberField('thinking.budget_tokens', 'thinkingBudgetTokens', { min: 1 })}
               </Box>
             </>
           )}
 
-          {form.apiType !== 'claude_messages' && (
+          {activeApiType !== 'claude_messages' && (
             <>
               <Typography variant="subtitle1">Metadata</Typography>
-              <KeyValueRows rows={metadataRows} onChange={setMetadataRows} />
+              <KeyValueRows
+                rows={activeProfile.metadataRows}
+                onChange={(metadataRows) => updateActiveProfile({ metadataRows })}
+              />
             </>
           )}
+
+          <Divider />
+          <TextField
+            select
+            label="Default model for new chats"
+            value={availableSelections.some((item) => selectionKey(item) === defaultModelKey)
+              ? defaultModelKey
+              : (availableSelections[0] ? selectionKey(availableSelections[0]) : '')}
+            onChange={(event) => setDefaultModelKey(event.target.value)}
+            disabled={!availableSelections.length}
+          >
+            {availableSelections.map((selection) => (
+              <MenuItem key={selectionKey(selection)} value={selectionKey(selection)}>
+                {selection.model} · {API_LABELS[selection.apiType]}
+              </MenuItem>
+            ))}
+          </TextField>
+
+          <FormControl fullWidth>
+            <InputLabel id="foundry-auth-label">Authentication</InputLabel>
+            <Select
+              id="foundry-auth"
+              labelId="foundry-auth-label"
+              label="Authentication"
+              value={common.authType}
+              disabled={common.endpointKind === 'project'}
+              onChange={(event) => changeAuthType(event.target.value as AuthType)}
+            >
+              <MenuItem value="entra_id">Microsoft Entra ID</MenuItem>
+              <MenuItem value="api_key">API key</MenuItem>
+            </Select>
+          </FormControl>
+
+          {common.authType === 'api_key' && (
+            <>
+              {initialConfig?.auth.apiKeyNeedsReplacement && (
+                <Alert severity="warning">
+                  The encrypted API key cannot be read. Verify the endpoint and every model profile, then enter a
+                  replacement key to retain the reviewed settings.
+                </Alert>
+              )}
+              <TextField
+                select
+                label="API key action"
+                value={common.secretAction}
+                onChange={(event) => {
+                  const secretAction = event.target.value as SecretAction;
+                  if (secretAction === 'clear') {
+                    setCommon((current) => ({
+                      ...current,
+                      authType: 'entra_id',
+                      secretAction: 'clear',
+                      apiKeyValue: '',
+                    }));
+                  } else setCommonField('secretAction', secretAction);
+                }}
+              >
+                {common.apiKeyConfigured && <MenuItem value="keep">Keep configured key</MenuItem>}
+                <MenuItem value="set">{common.apiKeyConfigured ? 'Replace key' : 'Set key'}</MenuItem>
+                {common.apiKeyConfigured && <MenuItem value="clear">Clear key and use Entra ID</MenuItem>}
+              </TextField>
+              {common.secretAction === 'set' && (
+                <TextField
+                  label="API key"
+                  type="password"
+                  value={common.apiKeyValue}
+                  onChange={(event) => setCommonField('apiKeyValue', event.target.value)}
+                  autoComplete="new-password"
+                  required
+                />
+              )}
+            </>
+          )}
+
+          <TextField
+            label="Agent Instructions"
+            value={common.agentInstructions}
+            onChange={(event) => setCommonField('agentInstructions', event.target.value)}
+            multiline
+            minRows={4}
+          />
         </Box>
       </DialogContent>
       <DialogActions>

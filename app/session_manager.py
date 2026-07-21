@@ -12,8 +12,9 @@ from uuid import uuid4
 from agent_framework import AgentSession, Message
 
 from app.config import DATA_DIR, ensure_data_dir
+from app.foundry_config import FoundrySettings, ModelSelection
 
-SESSION_SCHEMA_VERSION = 2
+SESSION_SCHEMA_VERSION = 3
 COMPLETED_STATUS = "completed"
 TRANSIENT_STATUSES = {"streaming", "running", "awaiting_approval"}
 NON_REPLAYABLE_STATUSES = {"cancelled", "interrupted", "error", *TRANSIENT_STATUSES}
@@ -62,6 +63,9 @@ class SessionManager:
         session.setdefault("preRunMafState", None)
         session.setdefault("configFingerprint", None)
         session.setdefault("stateEpoch", 0)
+        if "selectedModel" not in session:
+            session["selectedModel"] = None
+            changed = True
         session.pop("responseId", None)
         for raw in session["messages"]:
             if "id" not in raw:
@@ -85,10 +89,18 @@ class SessionManager:
     def list_sessions(self) -> List[Dict[str, Any]]:
         return [self.public_session(session) for session in self.sessions.values()]
 
-    def create(self, sid: str | None = None) -> Dict[str, Any]:
-        return self.create_session(sid)
+    def create(
+        self,
+        sid: str | None = None,
+        selected_model: ModelSelection | Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        return self.create_session(sid, selected_model)
 
-    def create_session(self, sid: str | None = None) -> Dict[str, Any]:
+    def create_session(
+        self,
+        sid: str | None = None,
+        selected_model: ModelSelection | Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         session_id = sid or str(uuid4())
         now = _utc_now()
         now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -104,6 +116,7 @@ class SessionManager:
             "preRunMafState": None,
             "configFingerprint": None,
             "stateEpoch": 0,
+            "selectedModel": self._selection_dict(selected_model),
         }
         self.sessions[session_id] = session
         self._save_session(session)
@@ -173,6 +186,35 @@ class SessionManager:
             safe_update["messages"] = migrated_messages
         session.update(safe_update)
         self._touch_and_save(session)
+
+    def set_selected_model(
+        self,
+        sid: str,
+        selection: ModelSelection | Dict[str, Any],
+        *,
+        touch: bool = True,
+    ) -> Dict[str, Any]:
+        session = self._require(sid)
+        session["selectedModel"] = self._selection_dict(selection)
+        if touch:
+            self._touch_and_save(session)
+        else:
+            self._save_session(session)
+        return self.public_session(session)
+
+    def selected_model(self, sid: str) -> ModelSelection | None:
+        value = self._require(sid).get("selectedModel")
+        return ModelSelection.model_validate(value) if value else None
+
+    def reconcile_model_selections(self, settings: FoundrySettings) -> list[Dict[str, Any]]:
+        updated: list[Dict[str, Any]] = []
+        default = settings.default_selection.model_dump(mode="json", by_alias=True)
+        for session in self.sessions.values():
+            if not settings.selection_exists(session.get("selectedModel")):
+                session["selectedModel"] = deepcopy(default)
+                self._save_session(session)
+                updated.append(self.public_session(session))
+        return updated
 
     def prepare_agent_session(self, sid: str, fingerprint: str) -> tuple[AgentSession, list[Message], bool]:
         """Restore matching MAF state or return normalized text history for replay."""
@@ -280,6 +322,15 @@ class SessionManager:
         if session is None:
             raise KeyError(f"Session '{sid}' not found.")
         return session
+
+    @staticmethod
+    def _selection_dict(
+        selection: ModelSelection | Dict[str, Any] | None,
+    ) -> Dict[str, Any] | None:
+        if selection is None:
+            return None
+        parsed = selection if isinstance(selection, ModelSelection) else ModelSelection.model_validate(selection)
+        return parsed.model_dump(mode="json", by_alias=True)
 
     def list(self) -> List[Dict[str, Any]]:
         return self.list_sessions()

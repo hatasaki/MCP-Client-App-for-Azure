@@ -37,6 +37,9 @@ RUN groupadd --system mcpclient \
     && mkdir -p /data \
     && chown -R mcpclient:mcpclient /app /data
 
+# API-key authentication fails closed unless MCPCLIENT_ENCRYPTION_KEY is
+# injected at runtime as URL-safe base64 for exactly 32 bytes. Never bake it
+# into the image; use the deployment platform's secret mechanism.
 ENV MCPCLIENT_HEADLESS=1 \
     MCPCLIENT_DATA_DIR=/data \
     PYTHONUNBUFFERED=1 \

@@ -10,6 +10,7 @@ from pathlib import Path
 import json
 import tempfile
 import traceback
+from uuid import uuid4
 
 import time
 
@@ -141,13 +142,42 @@ def main() -> None:
             or (Path(tempfile.gettempdir()) / "mcpclient-smoke-report.txt")
         )
         try:
+            os.environ.setdefault(
+                "MCPCLIENT_ENCRYPTION_KEY",
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            )
             from agent_framework_foundry import FoundryChatClient as _foundry_client  # noqa: F401
             from agent_framework_openai import (  # noqa: F401
                 OpenAIChatClient as _responses_client,
                 OpenAIChatCompletionClient as _chat_client,
             )
             from agent_framework_anthropic import AnthropicFoundryClient as _claude_client  # noqa: F401
+            import keyring as _keyring  # noqa: F401
+            _smoke_service = f"mcpclient-package-smoke-{uuid4()}"
+            _smoke_account = "temporary-key"
+            if sys.platform == "win32":
+                from keyring.backends.Windows import WinVaultKeyring
+                if WinVaultKeyring.priority < 1:
+                    raise RuntimeError("Windows Credential Manager keyring backend is unavailable.")
+            elif sys.platform == "darwin":
+                from keyring.backends.macOS import Keyring
+                if Keyring.priority < 1:
+                    raise RuntimeError("macOS Keychain backend is unavailable.")
+            if sys.platform in {"win32", "darwin"}:
+                try:
+                    _keyring.set_password(_smoke_service, _smoke_account, "native-keyring-smoke")
+                    if _keyring.get_password(_smoke_service, _smoke_account) != "native-keyring-smoke":
+                        raise RuntimeError("Native keyring roundtrip failed.")
+                finally:
+                    try:
+                        _keyring.delete_password(_smoke_service, _smoke_account)
+                    except Exception:
+                        pass
+            from app.secret_protection import SecretProtector
             from backend.main import app as _backend_app  # noqa: F401
+            _protector = SecretProtector()
+            if _protector.decrypt(_protector.encrypt("package-smoke")) != "package-smoke":
+                raise RuntimeError("Packaged AES-GCM roundtrip failed.")
         except BaseException:
             report_path.write_text(traceback.format_exc(), encoding="utf-8")
             os._exit(1)

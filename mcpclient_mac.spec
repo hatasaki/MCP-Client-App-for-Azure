@@ -22,6 +22,8 @@ _packages = [
 ]
 hiddenimports = [
     'backend.main',
+    'keyring',
+    'keyring.backends.macOS',
     'engineio.async_drivers.asgi',
     'uvicorn.logging',
     'uvicorn.loops.auto',
@@ -60,6 +62,8 @@ for distribution in [
     'azure-ai-projects',
     'azure-ai-inference',
     'azure-identity',
+    'cryptography',
+    'keyring',
 ]:
     datas += copy_metadata(distribution)
 

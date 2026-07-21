@@ -48,7 +48,8 @@ const MainLayout: React.FC = () => {
       const status = await statusResponse.json();
       setSettingsConfigured(Boolean(status.isConfigured));
       if (!status.isConfigured) {
-        setFoundrySettings(null);
+        setFoundrySettings(status.recoverableSettings || null);
+        if (typeof status.error === 'string' && status.error) setError(status.error);
         return;
       }
       const response = await fetch(`${backendUrl}/foundry-settings`);
@@ -83,11 +84,26 @@ const MainLayout: React.FC = () => {
       if (event.session) updateSession(event.session);
     };
 
+    const refresh = () => {
+      loadFoundrySettings();
+      socket.emit('getSessions');
+      socket.emit('getMCPServers');
+    };
+
+    const replaceSessions = (received: ChatSession[]) => {
+      setSessions(received);
+      setCurrentSession((current) => {
+        if (!current) return current;
+        return received.find((session) => session.id === current.id) || null;
+      });
+    };
+
+    socket.on('connect', refresh);
     socket.on('sessionCreated', (session: ChatSession) => {
       setCurrentSession(session);
       setSessions((previous) => [session, ...previous.filter((item) => item.id !== session.id)]);
     });
-    socket.on('sessions', setSessions);
+    socket.on('sessions', replaceSessions);
     socket.on('sessionLoaded', setCurrentSession);
     socket.on('sessionUpdated', updateSession);
     socket.on('chat:completed', terminalEvent);
@@ -125,8 +141,9 @@ const MainLayout: React.FC = () => {
     socket.emit('getMCPServers');
 
     return () => {
+      socket.off('connect', refresh);
       socket.off('sessionCreated');
-      socket.off('sessions');
+      socket.off('sessions', replaceSessions);
       socket.off('sessionLoaded');
       socket.off('sessionUpdated');
       socket.off('chat:completed', terminalEvent);
@@ -217,6 +234,7 @@ const MainLayout: React.FC = () => {
             session={currentSession}
             availableTools={availableTools}
             settingsConfigured={configured}
+            settings={foundrySettings}
             socket={socket}
           />
         ) : currentSession ? (
