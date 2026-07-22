@@ -38,7 +38,7 @@ const settings: FoundrySettings = {
 };
 
 const session: ChatSession = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   id: 'session-1',
   name: 'Model selection test',
   messages: [],
@@ -161,4 +161,58 @@ test('disconnect clears a lost active run so controls do not remain busy after r
   expect(input).not.toBeDisabled();
   expect(screen.getByText(/Connection was interrupted/i)).toBeInTheDocument();
   expect(screen.getByRole('combobox', { name: /^Model$/ })).not.toBeDisabled();
+});
+
+test('adds, removes, and sends supported attachments from the left plus button', async () => {
+  const { socket } = makeSocket();
+  render(
+    <ChatInterface
+      session={session}
+      availableTools={[]}
+      settingsConfigured
+      settings={settings}
+      socket={socket}
+    />
+  );
+
+  const file = new File(['hello'], 'notes.txt', { type: 'text/plain' });
+  Object.defineProperty(file, 'arrayBuffer', {
+    value: async () => new Uint8Array([104, 101, 108, 108, 111]).buffer,
+  });
+  const input = screen.getByLabelText('Attachment file input');
+  fireEvent.change(input, { target: { files: [file] } });
+
+  expect(await screen.findByText(/notes\.txt · 1 KB/)).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Send message' })).not.toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+
+  const chatCall = (socket.emit as jest.Mock).mock.calls.find(([event]) => event === 'chat:send');
+  expect(chatCall[1].message).toBe('');
+  expect(chatCall[1].attachments).toHaveLength(1);
+  expect(chatCall[1].attachments[0]).toMatchObject({
+    name: 'notes.txt',
+    mediaType: 'text/plain',
+    size: 5,
+  });
+  expect(chatCall[1].attachments[0].data).toBeInstanceOf(ArrayBuffer);
+  expect(screen.queryByText(/notes\.txt · 1 KB/)).not.toBeInTheDocument();
+});
+
+test('rejects unsupported attachment types before chat send', async () => {
+  const { socket } = makeSocket();
+  render(
+    <ChatInterface
+      session={session}
+      availableTools={[]}
+      settingsConfigured
+      settings={settings}
+      socket={socket}
+    />
+  );
+  const file = new File(['bad'], 'archive.zip', { type: 'application/zip' });
+  fireEvent.change(screen.getByLabelText('Attachment file input'), { target: { files: [file] } });
+
+  expect(await screen.findByText(/archive\.zip is not supported/)).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+  expect((socket.emit as jest.Mock).mock.calls.find(([event]) => event === 'chat:send')).toBeUndefined();
 });

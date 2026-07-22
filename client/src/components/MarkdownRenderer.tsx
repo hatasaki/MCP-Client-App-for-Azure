@@ -1,12 +1,46 @@
 import React from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import rehypeRaw from 'rehype-raw';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import { Box, Typography, Paper } from '@mui/material';
+
+import MermaidDiagram from './MermaidDiagram';
 
 interface MarkdownRendererProps {
   content: string;
   color?: string;
 }
+
+const safeHtmlSchema = {
+  ...defaultSchema,
+  tagNames: (defaultSchema.tagNames || []).filter((tag) => ![
+    'button',
+    'form',
+    'input',
+    'math',
+    'option',
+    'select',
+    'style',
+    'svg',
+    'textarea',
+  ].includes(tag)),
+  attributes: {
+    ...defaultSchema.attributes,
+    '*': (defaultSchema.attributes?.['*'] || []).filter((attribute) => attribute !== 'style'),
+    code: [
+      ...(defaultSchema.attributes?.code || []),
+      ['className', /^language-[A-Za-z0-9_-]+$/],
+    ],
+  },
+  protocols: {
+    ...defaultSchema.protocols,
+    href: ['http', 'https', 'mailto'],
+    src: ['http', 'https'],
+  },
+};
+
+const safeUrl = (value: string) => /^(https?:|mailto:)/i.test(value.trim()) ? value : '';
 
 const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, color = 'inherit' }) => {  return (
     <Box sx={{ 
@@ -17,6 +51,8 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, color = 'i
       overflowWrap: 'break-word',
     }}><ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, safeHtmlSchema]]}
+        urlTransform={safeUrl}
         components={{
           // 見出し
           h1: ({ children }) => (
@@ -151,6 +187,11 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, color = 'i
           code: ({ className, children, ...props }) => {
             const isInline = !className;
             const language = className ? className.replace('language-', '') : '';
+            const codeText = String(children).replace(/\n$/, '');
+
+            if (!isInline && language.toLowerCase() === 'mermaid') {
+              return <MermaidDiagram chart={codeText} />;
+            }
             
             return !isInline ? (
               <Box
@@ -210,7 +251,7 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content, color = 'i
                     {language}
                   </Typography>
                 )}                <code className={className} {...props}>
-                  {children}
+                  {codeText}
                 </code>
               </Paper>
               </Box>

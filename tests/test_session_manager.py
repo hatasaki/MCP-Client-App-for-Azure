@@ -43,11 +43,12 @@ def test_legacy_session_migrates_without_response_id(tmp_path: Path):
     session = manager.get_session("legacy")
 
     assert session is not None
-    assert session["schemaVersion"] == 3
+    assert session["schemaVersion"] == 4
     assert session["selectedModel"] is None
     assert "responseId" not in session
     assert all(message["status"] == "completed" for message in session["messages"])
     assert all(message["id"] for message in session["messages"])
+    assert all(message["attachments"] == [] for message in session["messages"])
 
 
 def test_matching_fingerprint_restores_full_agent_session(tmp_path: Path):
@@ -57,11 +58,11 @@ def test_matching_fingerprint_restores_full_agent_session(tmp_path: Path):
     original.state["custom"] = {"value": 42}
     manager.save_agent_session("chat", original, "same")
 
-    restored, replay, reset = manager.prepare_agent_session("chat", "same")
+    restored, replay_required, reset = manager.prepare_agent_session("chat", "same")
 
     assert restored.service_session_id == "resp_123"
     assert restored.state == {"custom": {"value": 42}}
-    assert replay == []
+    assert replay_required is False
     assert reset is False
 
 
@@ -69,10 +70,10 @@ def test_first_run_of_empty_session_is_not_reported_as_state_reset(tmp_path: Pat
     manager = SessionManager(tmp_path)
     manager.create("chat")
 
-    fresh, replay, reset = manager.prepare_agent_session("chat", "first")
+    fresh, replay_required, reset = manager.prepare_agent_session("chat", "first")
 
     assert fresh.service_session_id is None
-    assert replay == []
+    assert replay_required is False
     assert reset is False
     assert manager.get_session("chat")["stateEpoch"] == 0
 
@@ -86,20 +87,24 @@ def test_changed_fingerprint_replays_only_completed_text(tmp_path: Path):
     original = AgentSession(session_id="chat", service_session_id="resp_old")
     manager.save_agent_session("chat", original, "old")
 
-    fresh, replay, reset = manager.prepare_agent_session("chat", "new")
+    fresh, replay_required, reset = manager.prepare_agent_session("chat", "new")
+    replay = manager.build_replay_messages(manager.get_session("chat"))
 
     assert fresh.service_session_id is None
     assert [message.role for message in replay] == ["user", "assistant"]
     assert [message.text for message in replay] == ["first", "answer"]
+    assert replay_required is True
     assert reset is True
     assert manager.get_session("chat")["stateEpoch"] == 1
     assert manager.get_session("chat")["mafState"] is None
 
     # A process restart before the new run is saved must not revive old MAF state.
     reloaded = SessionManager(tmp_path)
-    restarted, restarted_replay, restarted_reset = reloaded.prepare_agent_session("chat", "new")
+    restarted, restarted_replay_required, restarted_reset = reloaded.prepare_agent_session("chat", "new")
+    restarted_replay = reloaded.build_replay_messages(reloaded.get_session("chat"))
     assert restarted.service_session_id is None
     assert [message.text for message in restarted_replay] == ["first", "answer"]
+    assert restarted_replay_required is True
     assert restarted_reset is True
 
 

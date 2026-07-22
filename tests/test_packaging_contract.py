@@ -30,6 +30,7 @@ def test_windows_specs_produce_onefile_and_compatibility_onedir():
         assert "'keyring'" in source
         assert "'cryptography'" in source
         assert "'keyring.backends.Windows'" in source
+        assert "'pypdf'" in source
 
     assert "onefile=True" in onefile
     assert "COLLECT(" not in onefile
@@ -44,6 +45,7 @@ def test_macos_bundle_uses_three_part_short_and_four_part_build_versions():
     assert "'CFBundleShortVersionString': SHORT_VERSION" in source
     assert "'CFBundleVersion': VERSION" in source
     assert "'keyring.backends.macOS'" in source
+    assert "'pypdf'" in source
 
 
 def test_windowed_smoke_writes_traceback_instead_of_showing_unreadable_modal():
@@ -123,6 +125,7 @@ def test_docker_and_ci_use_supported_node_lts():
 def test_secret_protection_dependencies_and_container_contract_are_explicit():
     assert "cryptography==49.0.0" in read("requirements.txt")
     assert "keyring==25.7.0" in read("requirements-desktop.txt")
+    assert "pypdf==6.14.2" in read("requirements.txt")
     dockerfile = read("Dockerfile")
     assert "MCPCLIENT_ENCRYPTION_KEY" in dockerfile
     assert "Never bake it" in dockerfile

@@ -5,6 +5,23 @@ export type AuthType = 'entra_id' | 'api_key';
 export type SecretAction = 'keep' | 'set' | 'clear';
 export type MessageStatus = 'streaming' | 'completed' | 'cancelled' | 'interrupted' | 'error';
 
+export type AttachmentMediaType = 'application/pdf' | 'text/plain' | 'image/jpeg' | 'image/png';
+
+export interface ChatAttachment {
+  id: string;
+  filename: string;
+  mediaType: AttachmentMediaType;
+  sizeBytes: number;
+  contentHash: string;
+}
+
+export interface ChatAttachmentUpload {
+  name: string;
+  mediaType: AttachmentMediaType;
+  size: number;
+  data: ArrayBuffer;
+}
+
 export interface MCPServerConfig {
   id?: string;
   name: string;
@@ -36,6 +53,7 @@ export interface ChatMessage {
   timestamp: string | Date;
   status?: MessageStatus;
   toolCalls?: string[];
+  attachments?: ChatAttachment[];
 }
 
 export interface ChatSession {

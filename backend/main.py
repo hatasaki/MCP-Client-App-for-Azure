@@ -22,6 +22,11 @@ from app.agent_runtime import (
     AgentRuntime,
     ApprovalNotFoundError,
 )
+from app.attachments import (
+    AttachmentError,
+    SOCKET_MAX_HTTP_BUFFER_BYTES,
+    parse_incoming_attachments,
+)
 from app.config import (
     foundry_settings_store,
     load_foundry_settings,
@@ -130,6 +135,7 @@ if STATIC_DIR.exists():
 sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins=allowed_origins or None,
+    max_http_buffer_size=SOCKET_MAX_HTTP_BUFFER_BYTES,
 )
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
@@ -335,11 +341,25 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
         return
 
     message = data.get("message")
+    try:
+        attachments = parse_incoming_attachments(data.get("attachments", []))
+    except AttachmentError as exc:
+        await sio.emit(
+            "chat:error",
+            _chat_error_payload(
+                request_id=request_id,
+                session_id=session_id,
+                code="InvalidAttachment",
+                message=str(exc),
+            ),
+            room=sid,
+        )
+        return
     selected_tool_ids = data.get("selectedToolIds", [])
     selected_model = data.get("selectedModel")
     if (
         not isinstance(message, str)
-        or not message.strip()
+        or (not message.strip() and not attachments)
         or not isinstance(selected_tool_ids, list)
         or any(not isinstance(item, str) for item in selected_tool_ids)
         or (selected_model is not None and not isinstance(selected_model, dict))
@@ -351,7 +371,8 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
                 session_id=session_id,
                 code="InvalidRequest",
                 message=(
-                    "message must be a non-empty string, selectedToolIds must be an array, "
+                    "message must be a string and either message or attachments must be non-empty; "
+                    "selectedToolIds must be an array, "
                     "and selectedModel must be an object when provided."
                 ),
             ),
@@ -468,6 +489,7 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
         await agent_runtime.run(
             session_id=session_id,
             message=message,
+            attachments=attachments,
             selected_tool_ids=selected_tool_ids,
             settings=runtime_settings,
             emit=emit,

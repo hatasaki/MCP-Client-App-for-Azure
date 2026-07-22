@@ -18,6 +18,8 @@ A desktop and container-ready Model Context Protocol (MCP) client for Microsoft 
 - **OAuth 2.0 for remote MCP servers** with flow-specific callback routing.
 - **Typed provider parameters** where empty means omit and explicit `false`, `0`, and `none` remain distinct.
 - **Multiple model deployments per endpoint**, with API-specific profiles and a persistent model choice for each chat.
+- **PDF, UTF-8 text, JPEG, and PNG attachments** with API-aware native/fallback handling, content-addressed persistence, and replay after an agent-state rebuild.
+- **GitHub Flavored Markdown, Mermaid, and sanitized static HTML rendering** for assistant output; generated JavaScript is never executed.
 - **AES-256-GCM API-key encryption** backed by Windows Credential Manager, macOS Keychain, or an injected container secret.
 - **Atomic settings/session persistence** and one-time encrypted legacy settings migration.
 - **Windows, macOS, and headless container packaging**.
@@ -157,10 +159,55 @@ Remote authorization follows the MCP OAuth flow. The app opens the authorization
 
 1. Select **New Chat**.
 2. Use the model selector below the input field to choose a configured deployment. Labels include the API type so identical deployment names remain distinguishable. Hover over the information icon for state-rebuild details.
-3. Select individual MCP tools or all tools from one server.
-4. Send a message and review streamed output.
-5. For each approval batch, approve selected calls, deny all calls, or enable **Always allow all** for that chat session.
-6. Select Stop to cancel the real in-flight task. Partial text is retained with `cancelled` status but is not replayed as completed history.
+3. Select the **+** button on the left side of the active chat's message box to attach PDF, UTF-8 TXT, JPEG/JPG, or PNG files.
+4. Select individual MCP tools or all tools from one server.
+5. Send a message and review streamed output. Assistant responses render GitHub Flavored Markdown, Mermaid code fences, and sanitized static HTML.
+6. For each approval batch, approve selected calls, deny all calls, or enable **Always allow all** for that chat session.
+7. Select Stop to cancel the real in-flight task. Partial text is retained with `cancelled` status but is not replayed as completed history.
+
+The **+** button is shown only after a chat is created or selected. It is disabled while a run is active, before Foundry settings are configured, or after 10 files are selected. Selected files appear as removable chips above the input. A text prompt is optional when files are attached; an attachment-only turn uses `Please analyze the attached file(s).` as its visible prompt.
+
+### File attachments
+
+The client and server both enforce these limits:
+
+- Supported formats: PDF (`application/pdf`), UTF-8 TXT (`text/plain`), JPEG/JPG (`image/jpeg`), and PNG (`image/png`).
+- Maximum 10 attachments per message.
+- Maximum 10 MB per attachment.
+- Maximum 25 MB of attachment data per message.
+- Filename extension, declared MIME type, declared byte count, and file signature/content are validated by the backend. Client-side validation is only an early usability check.
+
+Attachment handling follows the selected API profile:
+
+| API | Images | PDF | TXT |
+|---|---|---|---|
+| Responses | Native image input | Native `input_file` | Locally decoded UTF-8 text |
+| Chat Completions | Native image input | Locally extracted text | Locally decoded UTF-8 text |
+| Claude Messages | Native image input | Locally extracted text | Locally decoded UTF-8 text |
+
+For Responses, PDF bytes are sent inline as a native `input_file`, and images are sent as native image content. The selected Responses deployment must support both text and image input to process PDFs. Chat Completions receives images as `image_url` data URIs. Claude Messages receives images as base64 image blocks. Image capability still depends on the selected deployment; a provider/model rejection is returned as a chat error rather than silently discarding the file.
+
+PDF text fallback is intended for text PDFs. It reads at most 200 pages and shares a 200,000-character extraction budget across fallback TXT/PDF attachments in one message. Content beyond that budget is marked as truncated. Encrypted, unreadable, scanned, or image-only PDFs fail with a clear error; select a vision-capable Responses deployment to preserve page images, diagrams, and visual layout.
+
+Attachment binaries are saved outside session JSON using their SHA-256 content hash. Session messages contain only attachment metadata (`id`, `filename`, `mediaType`, `sizeBytes`, and `contentHash`). Stored bytes are integrity-checked before replay. Deleting a chat deletes its attachment directory; failed or cancelled turns otherwise retain their selected files with the chat.
+
+### Markdown, Mermaid, and HTML rendering
+
+- GitHub Flavored Markdown supports headings, lists, tables, block quotes, links, inline code, and fenced code blocks.
+- A fenced block whose language is `mermaid` is rendered as a diagram. Mermaid runs with `securityLevel: 'strict'`, HTML labels disabled, and the generated SVG sanitized again with DOMPurify. Invalid diagrams display a warning instead of executing content.
+- Raw HTML outside a code fence is parsed and sanitized before rendering. Scripts, event handlers, inline styles, forms and controls, embedded frames/objects, SVG/MathML, and unsafe URL schemes are removed. Links are restricted to HTTP, HTTPS, and `mailto`; image sources are restricted to HTTP and HTTPS.
+- HTML inside an `html` code fence remains source code. It is not rendered as an application.
+- Model-generated JavaScript and MCP Apps are not executed by this release.
+
+Example Mermaid response content:
+
+````text
+```mermaid
+flowchart LR
+  User --> Client
+  Client --> Model
+```
+````
 
 Tool IDs are qualified as `{server-id}:{remote-tool-name}`, preventing collisions between servers. To force one selected tool on the first model turn, prefix a prompt with its qualified ID, for example:
 
@@ -168,7 +215,7 @@ Tool IDs are qualified as `{server-id}:{remote-tool-name}`, preventing collision
 #weather-server:get_forecast What is the forecast for Seattle?
 ```
 
-The selected model is persisted per chat. Changing it is blocked during an active run. On the next message, provider-specific MAF state is rebuilt and only completed user/assistant text is replayed under that model's complete API profile. The same replay behavior applies when Foundry settings change; cancelled, interrupted, streaming, and error messages are excluded.
+The selected model is persisted per chat. Changing it is blocked during an active run. On the next message, provider-specific MAF state is rebuilt and completed user turns (including persisted attachments) plus completed assistant text are replayed under that model's complete API profile. The same replay behavior applies when Foundry settings change; cancelled, interrupted, streaming, and error assistant messages are excluded.
 
 ## Data and security
 
@@ -181,11 +228,14 @@ The data directory contains:
 
 - `FoundrySettings.json` — endpoint, API-specific model profiles, parameters, and an AES-GCM encrypted API-key envelope when configured.
 - `mcp.json` — saved MCP definitions, including configured headers/environment values.
-- `sessions/*.json` — visible messages plus opaque MAF session state.
+- `sessions/*.json` — schema-v4 visible messages, attachment metadata, selected model, and opaque MAF session state.
+- `sessions/attachments/<session-hash>/<sha256>` — content-addressed attachment binaries retained until the chat is deleted.
+
+Older session files are migrated to schema v4 when loaded. Existing messages receive an empty `attachments` array; no binary data is invented or deleted during migration.
 
 Desktop builds store the 256-bit encryption master key separately: Windows Credential Manager on Windows and login Keychain on macOS. `FoundrySettings.json` contains only `version`, `algorithm`, `keyId`, `nonce`, and authenticated ciphertext. Losing the OS credential prevents decryption; the status API exposes only validated non-secret profiles so the settings dialog can retain them while requiring a replacement API key. There is no plaintext fallback.
 
-The other files can still contain MCP headers, environment variables, opaque provider state, or chat content. Protect the directory with operating-system permissions and do not commit or share it. The browser receives only redacted Foundry settings.
+Attachment writes and session JSON writes use temporary files followed by atomic replacement. Attachment bytes are not duplicated in session JSON, but they are also not encrypted by the application. The other files can still contain MCP headers, environment variables, opaque provider state, chat content, or uploaded files. Protect the directory with operating-system permissions and do not commit or share it. The browser receives only redacted Foundry settings.
 
 Optional keys in `mcpclient.conf`:
 
@@ -236,15 +286,18 @@ For Entra ID in a container, provide a supported workload/environment/managed id
 ## Tests
 
 ```text
+python -m pip install -r requirements-test.txt
 python -m pytest -m "not live_foundry" -q
 cd client
+npm ci --legacy-peer-deps
 npm test -- --watchAll=false
+npm audit --omit=dev --audit-level=high
 npm run build
 ```
 
-Provider wire tests use mock HTTP transports and verify exact URLs, authentication headers, typed request bodies, and explicit omit semantics.
+Provider wire tests use mock HTTP transports and verify exact URLs, authentication headers, typed request bodies, explicit omit semantics, native Responses PDF/image input, Chat Completions image URLs, and Claude base64 image blocks. Attachment tests also cover limits, file signatures, content-addressed persistence, integrity checks, fallback extraction, replay, and deletion.
 
-Install `requirements-dev.txt` instead of `requirements.txt` before running Python tests.
+Use `requirements-test.txt` for headless backend tests, `requirements-dev.txt` for desktop tests, and `requirements-build.txt` for the complete desktop packaging toolchain.
 
 The live Foundry test is opt-in because it requires credentials, network access, and can incur usage charges:
 
@@ -259,7 +312,39 @@ No endpoint, model, or credential is hardcoded in the test suite.
 
 ## Packaging
 
-Build the React client first. Windows has two specs: `pyinstaller --clean mcpclient_win.spec` preserves the original one-file distribution, while `pyinstaller --clean mcpclient_win_onedir.spec` creates the compatibility onedir distribution. Use `pyinstaller --clean mcpclient_mac.spec` on macOS. The specs collect concrete MAF provider modules, MCP modules, distribution metadata, and runtime assets. The onedir option is provided because some enterprise Code Integrity policies reject DLLs dynamically extracted by unsigned one-file applications under `_MEI*` with Bad Image status `0xc0e90002`.
+The desktop package embeds a snapshot of `client/build`; it does not read React source files at runtime. Always rebuild the React client before PyInstaller after any frontend change. Running an existing executable from `dist` continues to show the old UI even when the source and `client/build` have been updated.
+
+On Windows, build both package variants from the repository root:
+
+```text
+.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+cd client
+npm ci --legacy-peer-deps
+npm run build
+cd ..
+.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm mcpclient_win.spec
+.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm mcpclient_win_onedir.spec
+```
+
+Use `python -m PyInstaller`, not the `pyinstaller.exe` console entry point, so the repository root remains on the Python module search path for `scripts.version`. The one-file result is `dist/mcpclient.exe`; the compatibility result is `dist/mcpclient-onedir/mcpclient.exe`. Keep the complete onedir folder together.
+
+On macOS, build the React client first and then run:
+
+```text
+.venv/bin/python -m pip install -r requirements-build.txt
+.venv/bin/python -m PyInstaller --clean --noconfirm mcpclient_mac.spec
+```
+
+The specs collect the current React build, concrete MAF provider modules, MCP/OpenAI/Anthropic modules, `pypdf`, distribution metadata, and runtime assets. The onedir option is provided because some enterprise Code Integrity policies reject DLLs dynamically extracted by unsigned one-file applications under `_MEI*` with Bad Image status `0xc0e90002`.
+
+If a newly added UI control, such as the attachment **+** button, is missing from a packaged app:
+
+1. Close every running `mcpclient` process.
+2. Rebuild `client/build` with `npm run build`.
+3. Re-run the relevant PyInstaller command above.
+4. Start the newly generated executable from `dist`, not an older extracted release directory.
+
+The **+** button appears only inside a created or selected chat. A missing button on the initial **Start a conversation** page is expected.
 
 ### Release process
 

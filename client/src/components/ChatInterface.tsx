@@ -5,6 +5,7 @@ import {
   Box,
   Button,
   Checkbox,
+  Chip,
   CircularProgress,
   Dialog,
   DialogActions,
@@ -24,7 +25,10 @@ import {
 import BuildIcon from '@mui/icons-material/Build';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
+import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
+import ImageOutlinedIcon from '@mui/icons-material/ImageOutlined';
 import PersonIcon from '@mui/icons-material/Person';
+import AddIcon from '@mui/icons-material/Add';
 import SendIcon from '@mui/icons-material/Send';
 import SmartToyIcon from '@mui/icons-material/SmartToy';
 import StopIcon from '@mui/icons-material/Stop';
@@ -36,6 +40,8 @@ import {
   ChatDeltaEvent,
   ChatMessage,
   ChatSession,
+  ChatAttachmentUpload,
+  AttachmentMediaType,
   ChatStartedEvent,
   ChatTerminalEvent,
   ChatToolStatusEvent,
@@ -64,6 +70,20 @@ const API_LABELS: Record<ModelSelection['apiType'], string> = {
   claude_messages: 'Claude Messages',
 };
 
+const MAX_ATTACHMENT_COUNT = 10;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const SUPPORTED_MEDIA_TYPES = new Set<AttachmentMediaType>([
+  'application/pdf',
+  'text/plain',
+  'image/jpeg',
+  'image/png',
+]);
+
+const formatFileSize = (size: number) => size >= 1024 * 1024
+  ? `${(size / (1024 * 1024)).toFixed(1)} MB`
+  : `${Math.max(1, Math.round(size / 1024))} KB`;
+
 const makeRequestId = () =>
   typeof crypto !== 'undefined' && crypto.randomUUID
     ? crypto.randomUUID()
@@ -77,6 +97,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   socket,
 }) => {
   const [message, setMessage] = useState('');
+  const [attachments, setAttachments] = useState<ChatAttachmentUpload[]>([]);
   const [selectedTools, setSelectedTools] = useState<SelectedTool[]>([]);
   const [showToolSelector, setShowToolSelector] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -99,6 +120,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const activeRequestRef = useRef<string | null>(null);
   const lastSequenceRef = useRef(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!socket) return;
@@ -204,6 +226,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
     setToolStatuses([]);
     setApprovalBatch(null);
     setApprovalDecisions({});
+    setAttachments([]);
   }, [session.id]);
 
   useEffect(() => {
@@ -226,7 +249,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   }, {} as Record<string, MCPTool[]>), [availableTools]);
 
   const sendMessage = () => {
-    if (!socket || !settingsConfigured || !message.trim() || isLoading) return;
+    if (!socket || !settingsConfigured || (!message.trim() && !attachments.length) || isLoading) return;
     const requestId = makeRequestId();
     activeRequestRef.current = requestId;
     lastSequenceRef.current = 0;
@@ -238,10 +261,50 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       requestId,
       sessionId: session.id,
       message: message.trim(),
+      attachments,
       selectedToolIds: selectedTools.map((tool) => tool.id),
       selectedModel,
     });
     setMessage('');
+    setAttachments([]);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const addAttachments = async (files: FileList | null) => {
+    if (!files?.length) return;
+    const incoming = Array.from(files);
+    const nextCount = attachments.length + incoming.length;
+    if (nextCount > MAX_ATTACHMENT_COUNT) {
+      setErrorMessage(`A message can contain at most ${MAX_ATTACHMENT_COUNT} attachments.`);
+      return;
+    }
+    const accepted: ChatAttachmentUpload[] = [];
+    let totalSize = attachments.reduce((sum, attachment) => sum + attachment.size, 0);
+    for (const file of incoming) {
+      const mediaType = (file.type === 'image/jpg' ? 'image/jpeg' : file.type) as AttachmentMediaType;
+      if (!SUPPORTED_MEDIA_TYPES.has(mediaType)) {
+        setErrorMessage(`${file.name} is not supported. Choose PDF, TXT, JPEG/JPG, or PNG.`);
+        return;
+      }
+      if (!file.size || file.size > MAX_ATTACHMENT_BYTES) {
+        setErrorMessage(`${file.name} must be larger than 0 bytes and no larger than 10 MB.`);
+        return;
+      }
+      totalSize += file.size;
+      if (totalSize > MAX_TOTAL_ATTACHMENT_BYTES) {
+        setErrorMessage('Attachments exceed the 25 MB combined request limit.');
+        return;
+      }
+      accepted.push({
+        name: file.name,
+        mediaType,
+        size: file.size,
+        data: await file.arrayBuffer(),
+      });
+    }
+    setAttachments((current) => [...current, ...accepted]);
+    setErrorMessage(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const cancel = () => {
@@ -332,6 +395,20 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
                   {item.role === 'user' ? <PersonIcon /> : <SmartToyIcon />}
                 </Avatar>
                 <Paper sx={{ p: 2, maxWidth: 'calc(100% - 56px)', bgcolor: item.role === 'user' ? 'primary.main' : 'grey.100', color: item.role === 'user' ? 'white' : 'inherit', overflowWrap: 'anywhere', userSelect: 'text' }}>
+                  {!!item.attachments?.length && (
+                    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mb: item.content ? 1 : 0 }}>
+                      {item.attachments.map((attachment) => (
+                        <Chip
+                          key={attachment.id}
+                          size="small"
+                          color={item.role === 'user' ? 'default' : undefined}
+                          icon={attachment.mediaType.startsWith('image/') ? <ImageOutlinedIcon /> : <DescriptionOutlinedIcon />}
+                          label={`${attachment.filename} · ${formatFileSize(attachment.sizeBytes)}`}
+                          sx={{ maxWidth: '100%', bgcolor: item.role === 'user' ? 'rgba(255,255,255,0.9)' : undefined }}
+                        />
+                      ))}
+                    </Box>
+                  )}
                   {item.content ? <MarkdownRenderer content={item.content} color={item.role === 'user' ? 'white' : 'inherit'} /> : item.status === 'streaming' ? <CircularProgress size={18} /> : null}
                   {!!item.toolCalls?.length && <Typography variant="caption" display="block">Tools: {item.toolCalls.join(', ')}</Typography>}
                   <Typography variant="caption" display="block" sx={{ opacity: 0.7, mt: 1 }}>
@@ -353,7 +430,43 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       </Box>
 
       <Paper sx={{ p: 2, mt: 'auto', bgcolor: 'background.default' }}>
+        {!!attachments.length && (
+          <Box aria-label="Selected attachments" sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mb: 1.25 }}>
+            {attachments.map((attachment, index) => (
+              <Chip
+                key={`${attachment.name}-${attachment.size}-${index}`}
+                icon={attachment.mediaType.startsWith('image/') ? <ImageOutlinedIcon /> : <DescriptionOutlinedIcon />}
+                label={`${attachment.name} · ${formatFileSize(attachment.size)}`}
+                onDelete={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+                disabled={isLoading}
+                sx={{ maxWidth: '100%' }}
+              />
+            ))}
+          </Box>
+        )}
         <Box data-testid="message-input-row" sx={{ display: 'flex', alignItems: 'center' }}>
+          <input
+            ref={fileInputRef}
+            type="file"
+            hidden
+            multiple
+            accept=".pdf,.txt,.jpg,.jpeg,.png,application/pdf,text/plain,image/jpeg,image/png"
+            onChange={(event) => void addAttachments(event.target.files)}
+            aria-label="Attachment file input"
+          />
+          <Tooltip title="Attach PDF, TXT, JPEG, or PNG (10 MB each; 25 MB total)">
+            <span>
+              <IconButton
+                aria-label="Add attachments"
+                color="primary"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={!settingsConfigured || isLoading || attachments.length >= MAX_ATTACHMENT_COUNT}
+                sx={{ mr: 1 }}
+              >
+                <AddIcon />
+              </IconButton>
+            </span>
+          </Tooltip>
           <TextField
             fullWidth
             multiline
@@ -372,7 +485,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
           <IconButton aria-label="Stop generation" color="secondary" onClick={cancel} disabled={!isLoading} sx={{ ml: 1 }}>
             <StopIcon />
           </IconButton>
-          <IconButton aria-label="Send message" color="primary" onClick={sendMessage} disabled={!message.trim() || !settingsConfigured || isLoading} sx={{ ml: 1 }}>
+          <IconButton aria-label="Send message" color="primary" onClick={sendMessage} disabled={(!message.trim() && !attachments.length) || !settingsConfigured || isLoading} sx={{ ml: 1 }}>
             {isLoading ? <CircularProgress size={24} /> : <SendIcon />}
           </IconButton>
         </Box>

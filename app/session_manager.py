@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,10 +12,11 @@ from uuid import uuid4
 
 from agent_framework import AgentSession, Message
 
+from app.attachments import AttachmentData, AttachmentStore
 from app.config import DATA_DIR, ensure_data_dir
 from app.foundry_config import FoundrySettings, ModelSelection
 
-SESSION_SCHEMA_VERSION = 3
+SESSION_SCHEMA_VERSION = 4
 COMPLETED_STATUS = "completed"
 TRANSIENT_STATUSES = {"streaming", "running", "awaiting_approval"}
 NON_REPLAYABLE_STATUSES = {"cancelled", "interrupted", "error", *TRANSIENT_STATUSES}
@@ -32,6 +34,7 @@ class SessionManager:
     def __init__(self, sessions_path: Path | None = None, max_replay_characters: int = 200_000):
         self.sessions_path = sessions_path or SESSIONS_PATH
         self.sessions_path.mkdir(parents=True, exist_ok=True)
+        self.attachment_store = AttachmentStore(self.sessions_path / "attachments")
         self.max_replay_characters = max_replay_characters
         self.sessions: Dict[str, Dict[str, Any]] = {}
         self._load_sessions()
@@ -82,6 +85,9 @@ class SessionManager:
                 raw["status"] = COMPLETED_STATUS
                 changed = True
             raw.setdefault("toolCalls", [])
+            if "attachments" not in raw:
+                raw["attachments"] = []
+                changed = True
         session.setdefault("createdAt", _utc_now())
         session.setdefault("updatedAt", session["createdAt"])
         return session, changed
@@ -145,6 +151,7 @@ class SessionManager:
         status: str = COMPLETED_STATUS,
         message_id: str | None = None,
         tool_calls: list[str] | None = None,
+        attachments: Sequence[Mapping[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         session = self._require(sid)
         message = {
@@ -154,6 +161,7 @@ class SessionManager:
             "timestamp": _utc_now(),
             "status": status,
             "toolCalls": list(tool_calls or []),
+            "attachments": deepcopy(list(attachments or [])),
         }
         session["messages"].append(message)
         self._touch_and_save(session)
@@ -182,6 +190,7 @@ class SessionManager:
                 item.setdefault("timestamp", _utc_now())
                 item.setdefault("status", COMPLETED_STATUS)
                 item.setdefault("toolCalls", [])
+                item.setdefault("attachments", [])
                 migrated_messages.append(item)
             safe_update["messages"] = migrated_messages
         session.update(safe_update)
@@ -216,29 +225,29 @@ class SessionManager:
                 updated.append(self.public_session(session))
         return updated
 
-    def prepare_agent_session(self, sid: str, fingerprint: str) -> tuple[AgentSession, list[Message], bool]:
-        """Restore matching MAF state or return normalized text history for replay."""
+    def prepare_agent_session(self, sid: str, fingerprint: str) -> tuple[AgentSession, bool, bool]:
+        """Restore matching MAF state or indicate that visible history must be replayed."""
         session = self._require(sid)
         previous_fingerprint = session.get("configFingerprint")
         state_matches = previous_fingerprint == fingerprint
         maf_state = session.get("mafState") if state_matches else None
-        replay: list[Message] = []
+        replay_required = False
         state_reset = False
         if isinstance(maf_state, dict):
             try:
                 agent_session = AgentSession.from_dict(deepcopy(maf_state))
             except Exception:
                 agent_session = AgentSession(session_id=sid)
-                replay = self.build_replay_messages(session)
+                replay_required = bool(self.replay_message_records(session))
                 state_matches = False
                 state_reset = True
         else:
             agent_session = AgentSession(session_id=sid)
-            replay = self.build_replay_messages(session)
+            replay_required = bool(self.replay_message_records(session))
             state_matches = False
             # A brand-new empty session does not represent a reset. Existing
             # history or any previous fingerprint does.
-            state_reset = bool(replay) or previous_fingerprint is not None
+            state_reset = replay_required or previous_fingerprint is not None
         if state_reset and previous_fingerprint is not None:
             session["stateEpoch"] = int(session.get("stateEpoch", 0)) + 1
         session["preRunMafState"] = deepcopy(session.get("mafState")) if state_matches else None
@@ -248,7 +257,7 @@ class SessionManager:
             session["mafState"] = None
         session["configFingerprint"] = fingerprint
         self._touch_and_save(session)
-        return agent_session, replay, state_reset
+        return agent_session, replay_required, state_reset
 
     def save_agent_session(self, sid: str, agent_session: AgentSession, fingerprint: str) -> None:
         session = self._require(sid)
@@ -264,6 +273,12 @@ class SessionManager:
         self._touch_and_save(session)
 
     def build_replay_messages(self, session: Dict[str, Any]) -> list[Message]:
+        return [
+            Message(role=item["role"], contents=[item["content"]])
+            for item in self.replay_message_records(session)
+        ]
+
+    def replay_message_records(self, session: Dict[str, Any]) -> list[Dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         for item in session.get("messages", []):
             if item.get("role") not in {"user", "assistant"}:
@@ -284,7 +299,23 @@ class SessionManager:
             selected.append(item)
             used += length
         selected.reverse()
-        return [Message(role=item["role"], contents=[item["content"]]) for item in selected]
+        return deepcopy(selected)
+
+    def store_attachments(
+        self,
+        sid: str,
+        attachments: Sequence[AttachmentData],
+    ) -> list[Dict[str, Any]]:
+        self._require(sid)
+        return self.attachment_store.store(sid, attachments)
+
+    def load_attachments(
+        self,
+        sid: str,
+        records: Sequence[Mapping[str, Any]],
+    ) -> list[AttachmentData]:
+        self._require(sid)
+        return self.attachment_store.load(sid, records)
 
     def delete_session(self, sid: str) -> None:
         if sid in self.sessions:
@@ -292,6 +323,7 @@ class SessionManager:
             file = self.sessions_path / f"{sid}.json"
             if file.exists():
                 file.unlink()
+        self.attachment_store.delete_session(sid)
 
     def _touch_and_save(self, session: Dict[str, Any]) -> None:
         if session["messages"] and session["name"].startswith("Chat"):

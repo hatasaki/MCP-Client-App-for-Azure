@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pypdf import PdfWriter
 from agent_framework import (
     AgentResponseUpdate,
     ChatResponse,
@@ -15,6 +17,7 @@ from agent_framework import (
 )
 
 from app.agent_runtime import AgentRunBusyError, AgentRuntime
+from app.attachments import AttachmentData
 from app.foundry_config import FoundrySettings
 from app.mcp_manager import MCPManager
 from app.provider_factory import ProviderBundle, RouteDescriptor
@@ -139,6 +142,88 @@ async def test_runtime_streams_and_persists_completed_message(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_runtime_sends_persists_and_replays_attachments(tmp_path: Path):
+    sessions = SessionManager(tmp_path)
+    sessions.create("chat")
+    client = FakeStreamingClient(["first", "second"])
+    runtime = AgentRuntime(
+        sessions,
+        MCPManager([]),
+        provider_factory=FakeProviderFactory(client),
+    )
+    import hashlib
+    image_data = b"\x89PNG\r\n\x1a\nimage"
+    attachment = AttachmentData(
+        "diagram.png",
+        "image/png",
+        image_data,
+        hashlib.sha256(image_data).hexdigest(),
+    )
+
+    await runtime.run(
+        session_id="chat",
+        message="describe",
+        attachments=[attachment],
+        selected_tool_ids=[],
+        settings=settings(),
+        emit=lambda event, payload: _capture([], event, payload),
+    )
+
+    assert len(client.calls[0][0]) == 1
+    first_user = client.calls[0][0][0]
+    assert [content.type for content in first_user.contents] == ["text", "data", "text"]
+    public = sessions.get("chat")
+    record = public["messages"][0]["attachments"][0]
+    assert record["filename"] == "diagram.png"
+    assert "data" not in record
+    assert sessions.attachment_store.session_directory("chat").is_dir()
+
+    # Force replay under a changed fingerprint. The persisted binary is loaded
+    # and reconstructed as MAF image content instead of being embedded in JSON.
+    await runtime.run(
+        session_id="chat",
+        message="follow up",
+        selected_tool_ids=[],
+        settings=settings("Changed instructions"),
+        emit=lambda event, payload: _capture([], event, payload),
+    )
+    replayed_user = client.calls[1][0][0]
+    assert [content.type for content in replayed_user.contents] == ["text", "data", "text"]
+
+
+@pytest.mark.asyncio
+async def test_attachment_only_runtime_uses_visible_default_prompt(tmp_path: Path):
+    sessions = SessionManager(tmp_path)
+    sessions.create("chat")
+    client = FakeStreamingClient(["answer"])
+    runtime = AgentRuntime(
+        sessions,
+        MCPManager([]),
+        provider_factory=FakeProviderFactory(client),
+    )
+    import hashlib
+    data = b"\x89PNG\r\n\x1a\nimage"
+    attachment = AttachmentData(
+        "diagram.png",
+        "image/png",
+        data,
+        hashlib.sha256(data).hexdigest(),
+    )
+
+    await runtime.run(
+        session_id="chat",
+        message="",
+        attachments=[attachment],
+        selected_tool_ids=[],
+        settings=settings(),
+        emit=lambda event, payload: _capture([], event, payload),
+    )
+
+    assert client.calls[0][0][0].text.endswith("Please analyze the attached file(s).")
+    assert sessions.get("chat")["messages"][0]["content"] == "Please analyze the attached file(s)."
+
+
+@pytest.mark.asyncio
 async def test_provider_construction_failure_closes_streaming_message(tmp_path: Path):
     sessions = SessionManager(tmp_path)
     sessions.create("chat")
@@ -156,7 +241,40 @@ async def test_provider_construction_failure_closes_streaming_message(tmp_path: 
 
     assistant = sessions.get("chat")["messages"][-1]
     assert assistant["status"] == "error"
+    assert [message["role"] for message in sessions.get("chat")["messages"]] == ["user", "assistant"]
     assert events[-1][0] == "chat:error"
+
+
+@pytest.mark.asyncio
+async def test_failed_attachment_run_retains_user_file_until_chat_deletion(tmp_path: Path):
+    sessions = SessionManager(tmp_path)
+    sessions.create("chat")
+    runtime = AgentRuntime(sessions, MCPManager([]), provider_factory=BrokenProviderFactory())
+    import hashlib
+    data = b"\x89PNG\r\n\x1a\nimage"
+    attachment = AttachmentData(
+        "diagram.png",
+        "image/png",
+        data,
+        hashlib.sha256(data).hexdigest(),
+    )
+
+    with pytest.raises(RuntimeError, match="provider construction failed"):
+        await runtime.run(
+            session_id="chat",
+            message="analyze",
+            attachments=[attachment],
+            selected_tool_ids=[],
+            settings=settings(),
+            emit=lambda event, payload: _capture([], event, payload),
+        )
+
+    assert sessions.get("chat")["messages"][0]["role"] == "user"
+    assert sessions.get("chat")["messages"][0]["attachments"][0]["filename"] == "diagram.png"
+    attachment_directory = sessions.attachment_store.session_directory("chat")
+    assert list(attachment_directory.iterdir())
+    sessions.delete("chat")
+    assert not attachment_directory.exists()
 
 
 @pytest.mark.asyncio
@@ -311,6 +429,51 @@ async def test_invalid_selected_tool_is_rejected_before_session_mutation(tmp_pat
     assert sessions.get("chat")["messages"] == []
     assert sessions.get("chat")["selectedModel"] is None
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_unextractable_pdf_is_rejected_before_session_mutation(tmp_path: Path):
+    sessions = SessionManager(tmp_path)
+    sessions.create("chat")
+    runtime = AgentRuntime(
+        sessions,
+        MCPManager([]),
+        provider_factory=FakeProviderFactory(FakeStreamingClient(["unused"])),
+    )
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    stream = io.BytesIO()
+    writer.write(stream)
+    data = stream.getvalue()
+    import hashlib
+    attachment = AttachmentData(
+        "scan.pdf",
+        "application/pdf",
+        data,
+        hashlib.sha256(data).hexdigest(),
+    )
+    chat_settings = FoundrySettings.model_validate({
+        "endpointKind": "model",
+        "endpoint": "https://example.openai.azure.com",
+        "model": "deployment",
+        "apiType": "chat_completions",
+        "versionMode": "v1",
+        "auth": {"type": "api_key", "apiKey": "secret"},
+        "options": {},
+    })
+
+    with pytest.raises(ValueError, match="no extractable text"):
+        await runtime.run(
+            session_id="chat",
+            message="analyze",
+            attachments=[attachment],
+            selected_tool_ids=[],
+            settings=chat_settings,
+            emit=lambda event, payload: _capture([], event, payload),
+        )
+
+    assert sessions.get("chat")["messages"] == []
+    assert not sessions.attachment_store.session_directory("chat").exists()
 
 
 def test_runtime_error_message_redacts_credentials():

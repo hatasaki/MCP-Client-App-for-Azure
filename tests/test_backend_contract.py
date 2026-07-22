@@ -247,6 +247,84 @@ async def test_adapter_level_chat_error_has_complete_terminal_contract(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_chat_send_rejects_invalid_attachment_before_reserving_run(monkeypatch):
+    events: list[tuple[str, dict[str, Any], str | None]] = []
+
+    async def capture(event: str, payload: dict[str, Any], room: str | None = None, **_kwargs: Any):
+        events.append((event, payload, room))
+
+    class RuntimeThatMustNotRun:
+        async def reserve_run(self, *_args: Any, **_kwargs: Any):
+            raise AssertionError("invalid attachments must be rejected before reservation")
+
+    monkeypatch.setattr(backend.sio, "emit", capture)
+    monkeypatch.setattr(backend, "foundry_settings", project_settings())
+    monkeypatch.setattr(backend, "agent_runtime", RuntimeThatMustNotRun())
+    await backend.connect("socket-attachment-invalid", {})
+
+    await backend.chat_send("socket-attachment-invalid", {
+        "requestId": "attachment-invalid",
+        "message": "inspect",
+        "attachments": [{
+            "name": "fake.png",
+            "mediaType": "image/png",
+            "size": 5,
+            "data": b"hello",
+        }],
+    })
+
+    errors = [payload for event, payload, _ in events if event == "chat:error"]
+    assert errors[-1]["code"] == "InvalidAttachment"
+    assert "fake.png" in errors[-1]["message"]
+
+
+@pytest.mark.asyncio
+async def test_attachment_only_chat_uses_default_prompt_and_forwards_binary(monkeypatch):
+    events: list[tuple[str, dict[str, Any], str | None]] = []
+    session_id = f"backend-{uuid4()}"
+    backend.session_manager.create(session_id, {"apiType": "responses", "model": "deployment"})
+
+    async def capture(event: str, payload: dict[str, Any], room: str | None = None, **_kwargs: Any):
+        events.append((event, payload, room))
+
+    class RecordingRuntime:
+        kwargs = None
+
+        async def reserve_run(self, _session_id: str, _request_id: str):
+            return object()
+
+        async def release_run(self, _reservation: object):
+            return None
+
+        async def run(self, **kwargs: Any):
+            self.kwargs = kwargs
+
+    runtime = RecordingRuntime()
+    png = b"\x89PNG\r\n\x1a\nimage"
+    monkeypatch.setattr(backend.sio, "emit", capture)
+    monkeypatch.setattr(backend, "foundry_settings", project_settings())
+    monkeypatch.setattr(backend, "agent_runtime", runtime)
+    await backend.connect("socket-attachment", {})
+
+    await backend.chat_send("socket-attachment", {
+        "requestId": "attachment-only",
+        "sessionId": session_id,
+        "message": "",
+        "selectedToolIds": [],
+        "attachments": [{
+            "name": "diagram.png",
+            "mediaType": "image/png",
+            "size": len(png),
+            "data": png,
+        }],
+    })
+
+    assert runtime.kwargs["message"] == ""
+    assert runtime.kwargs["attachments"][0].data == png
+    assert not [payload for event, payload, _ in events if event == "chat:error"]
+
+
+@pytest.mark.asyncio
 async def test_unhandled_runtime_failure_emits_terminal_fallback_and_closes_message(monkeypatch):
     events: list[tuple[str, dict[str, Any], str | None]] = []
     session_id = f"backend-{uuid4()}"

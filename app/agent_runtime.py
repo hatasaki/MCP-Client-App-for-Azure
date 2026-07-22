@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from agent_framework import Agent, AgentSession, Content, Message
 
+from app.attachments import AttachmentData, DEFAULT_ATTACHMENT_PROMPT, build_attachment_contents
 from app.foundry_config import FoundrySettings, ModelSelection, ResolvedFoundrySettings
 from app.mcp_manager import MCPManager
 from app.provider_factory import ProviderFactory
@@ -87,14 +88,15 @@ class AgentRuntime:
         *,
         session_id: str,
         message: str,
+        attachments: Sequence[AttachmentData] = (),
         selected_tool_ids: Sequence[str],
         settings: FoundrySettings | ResolvedFoundrySettings,
         emit: EventSink,
         request_id: str | None = None,
         reservation: RunReservation | None = None,
     ) -> RunResult:
-        if not message.strip():
-            raise ValueError("Message must not be empty.")
+        if not message.strip() and not attachments:
+            raise ValueError("Message or attachment must be provided.")
         run_request_id = request_id or str(uuid4())
         task = asyncio.current_task()
         if task is None:
@@ -111,9 +113,11 @@ class AgentRuntime:
             raise AgentRuntimeError("The run reservation does not match this request.")
         try:
             snapshot = settings.resolve() if isinstance(settings, FoundrySettings) else settings
+            normalized_message = message.strip() or DEFAULT_ATTACHMENT_PROMPT
             return await self._run_locked(
                 session_id=session_id,
-                message=message.strip(),
+                message=normalized_message,
+                attachments=attachments,
                 selected_tool_ids=selected_tool_ids,
                 settings=snapshot,
                 emit=emit,
@@ -157,6 +161,7 @@ class AgentRuntime:
         *,
         session_id: str,
         message: str,
+        attachments: Sequence[AttachmentData],
         selected_tool_ids: Sequence[str],
         settings: ResolvedFoundrySettings,
         emit: EventSink,
@@ -165,6 +170,7 @@ class AgentRuntime:
         # Validate user-controlled tool IDs before mutating persisted session state.
         selected_functions = self.mcp_manager.get_functions(selected_tool_ids)
         forced_qualified_id, clean_message = self._extract_forced_tool(message, selected_tool_ids)
+        current_attachment_contents = build_attachment_contents(attachments, settings.api_type)
         options = settings.to_maf_options()
         configured_tool_choice = options.get("tool_choice")
         if forced_qualified_id is not None:
@@ -180,6 +186,7 @@ class AgentRuntime:
         executed_tools: list[str] = []
         tool_calls_by_call_id: dict[str, str] = {}
         session_prepared = False
+        user_message_id: str | None = None
         assistant_persisted = False
         committed = False
 
@@ -202,14 +209,20 @@ class AgentRuntime:
                 self.session_manager.set_selected_model(session_id, settings.selection)
 
             fingerprint = settings.fingerprint()
-            agent_session, replay, state_reset = self.session_manager.prepare_agent_session(session_id, fingerprint)
+            agent_session, replay_required, state_reset = self.session_manager.prepare_agent_session(
+                session_id,
+                fingerprint,
+            )
             session_prepared = True
+            attachment_records = self.session_manager.store_attachments(session_id, attachments)
             user_message = self.session_manager.append_message(
                 session_id,
                 role="user",
                 content=message,
                 status="completed",
+                attachments=attachment_records,
             )
+            user_message_id = user_message["id"]
             self.session_manager.append_message(
                 session_id,
                 role="assistant",
@@ -227,9 +240,24 @@ class AgentRuntime:
                 "modelSelection": settings.selection.model_dump(mode="json", by_alias=True),
             })
 
-            current_message = Message(role="user", contents=[clean_message])
+            current_message = Message(
+                role="user",
+                contents=[
+                    *current_attachment_contents,
+                    clean_message,
+                ],
+            )
+            replay = (
+                self._build_replay_messages_with_attachments(
+                    session_id,
+                    settings,
+                    exclude_message_id=user_message_id,
+                )
+                if replay_required
+                else []
+            )
             current_input: str | list[Message]
-            current_input = [*replay, current_message] if replay else clean_message
+            current_input = [*replay, current_message] if replay else current_message
             bundle = self.provider_factory.create(settings)
             agent = Agent(
                 client=bundle.client,
@@ -537,6 +565,29 @@ class AgentRuntime:
         pending = self._pending_approvals.pop(run_request_id, None)
         if pending and not pending.future.done():
             pending.future.cancel()
+
+    def _build_replay_messages_with_attachments(
+        self,
+        session_id: str,
+        settings: ResolvedFoundrySettings,
+        *,
+        exclude_message_id: str | None = None,
+    ) -> list[Message]:
+        session = self.session_manager.get_session(session_id)
+        if session is None:
+            return []
+        replay: list[Message] = []
+        for item in self.session_manager.replay_message_records(session):
+            if item.get("id") == exclude_message_id:
+                continue
+            contents: list[Content | str] = []
+            records = item.get("attachments")
+            if item["role"] == "user" and isinstance(records, list) and records:
+                attachments = self.session_manager.load_attachments(session_id, records)
+                contents.extend(build_attachment_contents(attachments, settings.api_type))
+            contents.append(item["content"])
+            replay.append(Message(role=item["role"], contents=contents))
+        return replay
 
     @staticmethod
     def _approval_payload(request: Content) -> dict[str, Any]:

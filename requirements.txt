@@ -5,6 +5,7 @@ httpx==0.28.1
 pydantic==2.13.4
 azure-identity==1.25.3
 cryptography==49.0.0
+pypdf==6.14.2
 
 # Microsoft Agent Framework 1.x compatibility set (Python 3.10+)
 agent-framework-core==1.11.0

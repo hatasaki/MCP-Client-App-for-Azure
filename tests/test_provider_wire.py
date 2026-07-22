@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 import pytest
-from agent_framework import FunctionTool, Message
+from agent_framework import Content, FunctionTool, Message
 from azure.core.credentials import AccessToken
 
 from app.foundry_config import FoundrySettings
@@ -272,6 +272,92 @@ async def test_claude_foundry_maf_wire_url_auth_and_body():
     assert body["metadata"] == {"user_id": "wire-user"}
     assert "top_p" not in body
     assert response.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_responses_attachment_wire_uses_native_pdf_input_file_and_image():
+    capture = WireCapture(openai_response())
+    settings = make_settings()
+    bundle = ProviderFactory(http_client_factory=capture.factory).create(settings)
+
+    async with bundle:
+        await bundle.client.get_response(
+            [Message(role="user", contents=[
+                Content.from_data(
+                    b"%PDF-1.4\n%%EOF",
+                    "application/pdf",
+                    additional_properties={"filename": "report.pdf"},
+                ),
+                Content.from_data(b"\x89PNG\r\n\x1a\nimage", "image/png"),
+                "Analyze both files.",
+            ])],
+            options=settings.to_maf_options(),
+        )
+
+    content = capture.bodies[0]["input"][0]["content"]
+    assert content[0] == {
+        "type": "input_file",
+        "file_data": "data:application/pdf;base64,JVBERi0xLjQKJSVFT0Y=",
+        "filename": "report.pdf",
+    }
+    assert content[1]["type"] == "input_image"
+    assert content[1]["image_url"].startswith("data:image/png;base64,")
+    assert content[2] == {"type": "input_text", "text": "Analyze both files."}
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_attachment_wire_uses_image_url():
+    capture = WireCapture(chat_response())
+    settings = make_settings(
+        apiType="chat_completions",
+        versionMode="dated",
+        apiVersion="2025-04-01-preview",
+    )
+    bundle = ProviderFactory(http_client_factory=capture.factory).create(settings)
+
+    async with bundle:
+        await bundle.client.get_response(
+            [Message(role="user", contents=[
+                Content.from_data(b"\x89PNG\r\n\x1a\nimage", "image/png"),
+                "Describe the image.",
+            ])],
+            options=settings.to_maf_options(),
+        )
+
+    messages = capture.bodies[0]["messages"]
+    assert messages[0]["content"][0]["type"] == "image_url"
+    assert messages[0]["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert messages[1] == {"role": "user", "content": "Describe the image."}
+
+
+@pytest.mark.asyncio
+async def test_claude_attachment_wire_uses_base64_image_block():
+    capture = WireCapture(anthropic_response())
+    settings = make_settings(
+        model="claude-deployment",
+        apiType="claude_messages",
+        versionMode="provider",
+        options={"maxTokens": 47},
+    )
+    bundle = ProviderFactory(http_client_factory=capture.factory).create(settings)
+
+    async with bundle:
+        await bundle.client.get_response(
+            [Message(role="user", contents=[
+                Content.from_data(b"\xff\xd8\xffimage", "image/jpeg"),
+                "Describe the image.",
+            ])],
+            options=settings.to_maf_options(),
+        )
+
+    content = capture.bodies[0]["messages"][0]["content"]
+    assert content[0]["type"] == "image"
+    assert content[0]["source"] == {
+        "data": "/9j/aW1hZ2U=",
+        "media_type": "image/jpeg",
+        "type": "base64",
+    }
+    assert content[1] == {"type": "text", "text": "Describe the image."}
 
 
 @pytest.mark.parametrize(
