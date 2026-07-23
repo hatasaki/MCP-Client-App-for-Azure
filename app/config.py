@@ -111,6 +111,7 @@ DATA_DIR = _saved_dir
 AZURE_CONF_PATH = DATA_DIR / "AzureOpenAI.json"
 FOUNDRY_CONF_PATH = DATA_DIR / "FoundrySettings.json"
 MCP_CONF_PATH = DATA_DIR / "mcp.json"
+SKILLS_PATH = DATA_DIR / "skills"
 
 foundry_settings_store = FoundrySettingsStore(FOUNDRY_CONF_PATH, AZURE_CONF_PATH)
 

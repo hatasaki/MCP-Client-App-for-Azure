@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -15,6 +16,7 @@ from app.foundry_config import FoundrySettings, ModelSelection, ResolvedFoundryS
 from app.mcp_manager import MCPManager
 from app.provider_factory import ProviderFactory
 from app.session_manager import SessionManager
+from app.skills_manager import SkillsManager
 
 EventSink = Callable[[str, dict[str, Any]], Awaitable[None]]
 
@@ -73,10 +75,12 @@ class AgentRuntime:
         mcp_manager: MCPManager,
         *,
         provider_factory: ProviderFactory | None = None,
+        skills_manager: SkillsManager | None = None,
     ) -> None:
         self.session_manager = session_manager
         self.mcp_manager = mcp_manager
         self.provider_factory = provider_factory or ProviderFactory()
+        self.skills_manager = skills_manager
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._active_tasks: dict[str, asyncio.Task[Any]] = {}
         self._active_request_ids: dict[str, str] = {}
@@ -89,6 +93,7 @@ class AgentRuntime:
         session_id: str,
         message: str,
         attachments: Sequence[AttachmentData] = (),
+        selected_skill_ids: Sequence[str] = (),
         selected_tool_ids: Sequence[str],
         settings: FoundrySettings | ResolvedFoundrySettings,
         emit: EventSink,
@@ -118,6 +123,7 @@ class AgentRuntime:
                 session_id=session_id,
                 message=normalized_message,
                 attachments=attachments,
+                selected_skill_ids=selected_skill_ids,
                 selected_tool_ids=selected_tool_ids,
                 settings=snapshot,
                 emit=emit,
@@ -162,6 +168,7 @@ class AgentRuntime:
         session_id: str,
         message: str,
         attachments: Sequence[AttachmentData],
+        selected_skill_ids: Sequence[str],
         selected_tool_ids: Sequence[str],
         settings: ResolvedFoundrySettings,
         emit: EventSink,
@@ -171,6 +178,7 @@ class AgentRuntime:
         selected_functions = self.mcp_manager.get_functions(selected_tool_ids)
         forced_qualified_id, clean_message = self._extract_forced_tool(message, selected_tool_ids)
         current_attachment_contents = build_attachment_contents(attachments, settings.api_type)
+        skills_provider = self.skills_manager.create_provider(selected_skill_ids) if self.skills_manager else None
         options = settings.to_maf_options()
         configured_tool_choice = options.get("tool_choice")
         if forced_qualified_id is not None:
@@ -207,8 +215,17 @@ class AgentRuntime:
         try:
             if self.session_manager.selected_model(session_id) != settings.selection:
                 self.session_manager.set_selected_model(session_id, settings.selection)
+            if self.session_manager.selected_skill_ids(session_id) != list(selected_skill_ids):
+                self.session_manager.set_selected_skills(session_id, selected_skill_ids)
 
-            fingerprint = settings.fingerprint()
+            skills_fingerprint = (
+                self.skills_manager.fingerprint(selected_skill_ids)
+                if self.skills_manager
+                else hashlib.sha256(b"[]").hexdigest()
+            )
+            fingerprint = hashlib.sha256(
+                f"{settings.fingerprint()}:{skills_fingerprint}".encode("utf-8")
+            ).hexdigest()
             agent_session, replay_required, state_reset = self.session_manager.prepare_agent_session(
                 session_id,
                 fingerprint,
@@ -264,6 +281,7 @@ class AgentRuntime:
                 name="MCPClientAgent",
                 instructions=settings.agent_instructions,
                 tools=selected_functions,
+                context_providers=[skills_provider] if skills_provider else None,
                 default_options=options,
             )
             async with bundle, agent:
@@ -504,6 +522,9 @@ class AgentRuntime:
         task = self._active_tasks.get(session_id)
         return bool(task and not task.done())
 
+    def has_active_runs(self) -> bool:
+        return any(not task.done() for task in self._active_tasks.values())
+
     async def set_selected_model(
         self,
         session_id: str,
@@ -515,6 +536,22 @@ class AgentRuntime:
             raise AgentRunBusyError(f"Session '{session_id}' already has an active run.")
         async with lock:
             return self.session_manager.set_selected_model(session_id, selection)
+
+    async def set_selected_skills(
+        self,
+        session_id: str,
+        skill_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        """Validate and persist selected skills only when no run is active."""
+        if self.skills_manager:
+            self.skills_manager.fingerprint(skill_ids)
+        elif skill_ids:
+            raise ValueError("Agent Skills are not available.")
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked():
+            raise AgentRunBusyError(f"Session '{session_id}' already has an active run.")
+        async with lock:
+            return self.session_manager.set_selected_skills(session_id, skill_ids)
 
     async def apply_settings_update(
         self,

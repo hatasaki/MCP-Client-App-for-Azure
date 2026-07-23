@@ -12,6 +12,7 @@ import backend.main as backend
 from app.agent_runtime import AgentRunBusyError
 from app.foundry_config import FoundrySettings, FoundrySettingsWrite
 from app.secret_protection import SecretProtectionError
+from app.skills_manager import SkillsManager
 
 
 def project_settings() -> FoundrySettings:
@@ -45,6 +46,10 @@ def project_write_payload() -> dict[str, Any]:
         }],
         "defaultSelection": {"apiType": "responses", "model": "deployment"},
     }
+
+
+def skill_markdown(name: str) -> bytes:
+    return f"---\nname: {name}\ndescription: Use {name} for testing.\n---\n# Instructions\nBe helpful.\n".encode()
 
 
 def test_foundry_settings_rest_contract_and_secret_redaction(monkeypatch):
@@ -189,6 +194,68 @@ def test_startup_corrupt_json_is_sanitized_and_does_not_prevent_health(monkeypat
     assert status["isConfigured"] is False
     assert status["error"] == "Microsoft Foundry settings are invalid or corrupted. Replace the complete settings."
     assert "secret fragment" not in str(status)
+
+
+def test_skills_rest_upload_list_and_delete_contract(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "SKILLS_PATH", tmp_path / "skills")
+    monkeypatch.setattr(backend, "load_foundry_settings", lambda: None)
+
+    with TestClient(backend.fastapi_app) as client:
+        uploaded = client.post(
+            "/skills/upload",
+            content=skill_markdown("rest-skill"),
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Skill-Filename": "SKILL.md",
+            },
+        )
+        assert uploaded.status_code == 200
+        assert uploaded.json()["uploaded"][0]["id"] == "rest-skill"
+        assert client.get("/skills").json()["skills"][0]["name"] == "rest-skill"
+
+        deleted = client.delete("/skills/rest-skill")
+        assert deleted.status_code == 200
+        assert deleted.json() == {"skills": []}
+
+
+def test_skills_rest_rejects_oversized_declared_upload(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "SKILLS_PATH", tmp_path / "skills")
+    monkeypatch.setattr(backend, "load_foundry_settings", lambda: None)
+
+    with TestClient(backend.fastapi_app) as client:
+        response = client.post(
+            "/skills/upload",
+            content=b"small",
+            headers={
+                "X-Skill-Filename": "SKILL.md",
+                "Content-Length": str(10 * 1024 * 1024 + 1),
+            },
+        )
+
+    assert response.status_code == 413
+
+
+def test_skills_rest_rejects_mutation_while_a_run_is_active(monkeypatch, tmp_path):
+    class BusyRuntime:
+        def has_active_runs(self):
+            return True
+
+        async def shutdown(self):
+            return None
+
+    monkeypatch.setattr(backend, "SKILLS_PATH", tmp_path / "skills")
+    monkeypatch.setattr(backend, "load_foundry_settings", lambda: None)
+    monkeypatch.setattr(backend, "AgentRuntime", lambda *_args, **_kwargs: BusyRuntime())
+
+    with TestClient(backend.fastapi_app) as client:
+        response = client.post(
+            "/skills/upload",
+            content=skill_markdown("busy-skill"),
+            headers={"X-Skill-Filename": "SKILL.md"},
+        )
+
+    assert response.status_code == 409
+    assert "active" in response.json()["detail"]
 
 
 def test_settings_update_rejects_active_model_removal(monkeypatch):
@@ -427,6 +494,48 @@ async def test_chat_send_resolves_the_complete_selected_model_configuration(monk
 
 
 @pytest.mark.asyncio
+async def test_chat_send_validates_and_forwards_selected_skills(monkeypatch, tmp_path):
+    events: list[tuple[str, dict[str, Any], str | None]] = []
+    session_id = f"backend-{uuid4()}"
+    backend.session_manager.create(session_id, {"apiType": "responses", "model": "deployment"})
+    manager = SkillsManager(tmp_path / "skills")
+    await manager.upload("SKILL.md", skill_markdown("chat-skill"))
+
+    async def capture(event: str, payload: dict[str, Any], room: str | None = None, **_kwargs: Any):
+        events.append((event, payload, room))
+
+    class RecordingRuntime:
+        selected_skill_ids = None
+
+        async def reserve_run(self, _session_id: str, _request_id: str):
+            return object()
+
+        async def release_run(self, _reservation):
+            return None
+
+        async def run(self, *, selected_skill_ids, **_kwargs: Any):
+            self.selected_skill_ids = selected_skill_ids
+
+    runtime = RecordingRuntime()
+    monkeypatch.setattr(backend.sio, "emit", capture)
+    monkeypatch.setattr(backend, "foundry_settings", project_settings())
+    monkeypatch.setattr(backend, "skills_manager", manager)
+    monkeypatch.setattr(backend, "agent_runtime", runtime)
+    await backend.connect("socket-skill", {})
+
+    await backend.chat_send("socket-skill", {
+        "requestId": "request-skill",
+        "sessionId": session_id,
+        "message": "use it",
+        "selectedToolIds": [],
+        "selectedSkillIds": ["chat-skill"],
+    })
+
+    assert runtime.selected_skill_ids == ["chat-skill"]
+    assert not [payload for event, payload, _ in events if event == "chat:error"]
+
+
+@pytest.mark.asyncio
 async def test_invalid_model_selection_does_not_create_orphan_session(monkeypatch):
     events: list[tuple[str, dict[str, Any], str | None]] = []
     before = set(backend.session_manager.sessions)
@@ -506,6 +615,35 @@ async def test_set_session_model_is_rejected_while_run_lock_is_active(monkeypatc
     assert errors[-1]["message"] == "The model cannot be changed while a run is active."
     rollbacks = [payload for event, payload, _ in events if event == "sessionUpdated"]
     assert rollbacks[-1]["selectedModel"]["model"] == "deployment"
+
+
+@pytest.mark.asyncio
+async def test_set_session_skills_always_validates_library(monkeypatch, tmp_path):
+    events: list[tuple[str, dict[str, Any], str | None]] = []
+    session_id = f"backend-{uuid4()}"
+    backend.session_manager.create(session_id)
+    manager = SkillsManager(tmp_path / "skills")
+    await manager.upload("SKILL.md", skill_markdown("valid-skill"))
+
+    async def capture(event: str, payload: dict[str, Any], room: str | None = None, **_kwargs: Any):
+        events.append((event, payload, room))
+
+    monkeypatch.setattr(backend.sio, "emit", capture)
+    monkeypatch.setattr(backend, "skills_manager", manager)
+    monkeypatch.setattr(backend, "agent_runtime", None)
+
+    await backend.setSessionSkills("socket-skill-select", {
+        "sessionId": session_id,
+        "selectedSkillIds": ["missing"],
+    })
+    assert backend.session_manager.selected_skill_ids(session_id) == []
+    assert "not found" in [payload for event, payload, _ in events if event == "error"][-1]["message"]
+
+    await backend.setSessionSkills("socket-skill-select", {
+        "sessionId": session_id,
+        "selectedSkillIds": ["valid-skill"],
+    })
+    assert backend.session_manager.selected_skill_ids(session_id) == ["valid-skill"]
 
 
 @pytest.mark.asyncio

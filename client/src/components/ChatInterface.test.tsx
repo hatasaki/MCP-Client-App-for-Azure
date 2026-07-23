@@ -1,5 +1,5 @@
 import React from 'react';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Socket } from 'socket.io-client';
 
 jest.mock('./MarkdownRenderer', () => ({
@@ -38,7 +38,7 @@ const settings: FoundrySettings = {
 };
 
 const session: ChatSession = {
-  schemaVersion: 4,
+  schemaVersion: 5,
   id: 'session-1',
   name: 'Model selection test',
   messages: [],
@@ -66,6 +66,7 @@ test('shows the session model and distinguishes duplicate names by API', async (
     <ChatInterface
       session={session}
       availableTools={[]}
+      availableSkills={[]}
       settingsConfigured
       settings={settings}
       socket={socket}
@@ -89,6 +90,7 @@ test('places the model selector below the message input row', () => {
     <ChatInterface
       session={session}
       availableTools={[]}
+      availableSkills={[]}
       settingsConfigured
       settings={settings}
       socket={socket}
@@ -112,6 +114,7 @@ test('persists model changes and includes the complete selection in chat send', 
     <ChatInterface
       session={session}
       availableTools={[]}
+      availableSkills={[]}
       settingsConfigured
       settings={settings}
       socket={socket}
@@ -146,6 +149,7 @@ test('disconnect clears a lost active run so controls do not remain busy after r
     <ChatInterface
       session={session}
       availableTools={[]}
+      availableSkills={[]}
       settingsConfigured
       settings={settings}
       socket={socket}
@@ -169,6 +173,7 @@ test('adds, removes, and sends supported attachments from the left plus button',
     <ChatInterface
       session={session}
       availableTools={[]}
+      availableSkills={[]}
       settingsConfigured
       settings={settings}
       socket={socket}
@@ -204,6 +209,7 @@ test('rejects unsupported attachment types before chat send', async () => {
     <ChatInterface
       session={session}
       availableTools={[]}
+      availableSkills={[]}
       settingsConfigured
       settings={settings}
       socket={socket}
@@ -215,4 +221,44 @@ test('rejects unsupported attachment types before chat send', async () => {
   expect(await screen.findByText(/archive\.zip is not supported/)).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
   expect((socket.emit as jest.Mock).mock.calls.find(([event]) => event === 'chat:send')).toBeUndefined();
+});
+
+test('selects Agent Skills per chat and includes them in chat send', async () => {
+  const { socket } = makeSocket();
+  const skill = {
+    id: 'writing-guide',
+    name: 'writing-guide',
+    description: 'Use for writing tasks.',
+    contentHash: 'a'.repeat(64),
+    resourceCount: 0,
+    resourceBytes: 0,
+    scriptsIgnored: false,
+    sourceFilename: 'SKILL.md',
+  };
+  render(
+    <ChatInterface
+      session={session}
+      availableTools={[]}
+      availableSkills={[skill]}
+      settingsConfigured
+      settings={settings}
+      socket={socket}
+    />
+  );
+
+  fireEvent.click(screen.getByRole('button', { name: 'Select skills (0/1)' }));
+  fireEvent.click(screen.getByRole('checkbox', { name: /writing-guide/ }));
+  expect(socket.emit).toHaveBeenCalledWith('setSessionSkills', {
+    sessionId: 'session-1',
+    selectedSkillIds: ['writing-guide'],
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+  await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Select Agent Skills for this chat' })).not.toBeInTheDocument());
+
+  fireEvent.change(screen.getByPlaceholderText('Type a message (Shift+Enter for newline)'), {
+    target: { value: 'apply the guide' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+  const chatCall = (socket.emit as jest.Mock).mock.calls.find(([event]) => event === 'chat:send');
+  expect(chatCall[1].selectedSkillIds).toEqual(['writing-guide']);
 });

@@ -43,8 +43,9 @@ def test_legacy_session_migrates_without_response_id(tmp_path: Path):
     session = manager.get_session("legacy")
 
     assert session is not None
-    assert session["schemaVersion"] == 4
+    assert session["schemaVersion"] == 5
     assert session["selectedModel"] is None
+    assert session["selectedSkillIds"] == []
     assert "responseId" not in session
     assert all(message["status"] == "completed" for message in session["messages"])
     assert all(message["id"] for message in session["messages"])
@@ -166,6 +167,28 @@ def test_selected_model_is_persisted_and_reloaded(tmp_path: Path):
     assert created["selectedModel"]["model"] == "primary"
     assert updated["selectedModel"]["model"] == "secondary"
     assert reloaded.selected_model("chat").model == "secondary"
+
+
+def test_selected_skills_are_persisted_and_removed_from_all_sessions(tmp_path: Path):
+    manager = SessionManager(tmp_path)
+    manager.create("one")
+    manager.create("two")
+    manager.set_selected_skills("one", ["alpha", "beta"])
+    manager.set_selected_skills("two", ["beta"])
+    reloaded = SessionManager(tmp_path)
+
+    assert reloaded.selected_skill_ids("one") == ["alpha", "beta"]
+    assert reloaded.selected_skill_ids("two") == ["beta"]
+    updated = reloaded.remove_skill_from_sessions("beta")
+
+    assert {session["id"] for session in updated} == {"one", "two"}
+    assert reloaded.selected_skill_ids("one") == ["alpha"]
+    assert reloaded.selected_skill_ids("two") == []
+
+    reloaded.set_selected_skills("one", ["alpha", "missing"])
+    reconciled = reloaded.reconcile_skill_selections({"alpha"})
+    assert [session["id"] for session in reconciled] == ["one"]
+    assert reloaded.selected_skill_ids("one") == ["alpha"]
 
 
 def test_reconcile_resets_only_missing_or_invalid_model_selections(tmp_path: Path):

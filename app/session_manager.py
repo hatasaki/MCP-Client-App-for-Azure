@@ -16,7 +16,7 @@ from app.attachments import AttachmentData, AttachmentStore
 from app.config import DATA_DIR, ensure_data_dir
 from app.foundry_config import FoundrySettings, ModelSelection
 
-SESSION_SCHEMA_VERSION = 4
+SESSION_SCHEMA_VERSION = 5
 COMPLETED_STATUS = "completed"
 TRANSIENT_STATUSES = {"streaming", "running", "awaiting_approval"}
 NON_REPLAYABLE_STATUSES = {"cancelled", "interrupted", "error", *TRANSIENT_STATUSES}
@@ -68,6 +68,9 @@ class SessionManager:
         session.setdefault("stateEpoch", 0)
         if "selectedModel" not in session:
             session["selectedModel"] = None
+            changed = True
+        if "selectedSkillIds" not in session:
+            session["selectedSkillIds"] = []
             changed = True
         session.pop("responseId", None)
         for raw in session["messages"]:
@@ -123,6 +126,7 @@ class SessionManager:
             "configFingerprint": None,
             "stateEpoch": 0,
             "selectedModel": self._selection_dict(selected_model),
+            "selectedSkillIds": [],
         }
         self.sessions[session_id] = session
         self._save_session(session)
@@ -214,6 +218,58 @@ class SessionManager:
     def selected_model(self, sid: str) -> ModelSelection | None:
         value = self._require(sid).get("selectedModel")
         return ModelSelection.model_validate(value) if value else None
+
+    def selected_skill_ids(self, sid: str) -> list[str]:
+        value = self._require(sid).get("selectedSkillIds", [])
+        return list(value) if isinstance(value, list) else []
+
+    def set_selected_skills(
+        self,
+        sid: str,
+        skill_ids: Sequence[str],
+        *,
+        touch: bool = True,
+    ) -> Dict[str, Any]:
+        session = self._require(sid)
+        session["selectedSkillIds"] = list(skill_ids)
+        if touch:
+            self._touch_and_save(session)
+        else:
+            self._save_session(session)
+        return self.public_session(session)
+
+    def remove_skill_from_sessions(self, skill_id: str) -> list[Dict[str, Any]]:
+        updated: list[Dict[str, Any]] = []
+        for session in self.sessions.values():
+            selected = session.get("selectedSkillIds", [])
+            if isinstance(selected, list) and skill_id in selected:
+                session["selectedSkillIds"] = [item for item in selected if item != skill_id]
+                session["mafState"] = None
+                session["preRunMafState"] = None
+                session["configFingerprint"] = None
+                session["stateEpoch"] = int(session.get("stateEpoch", 0)) + 1
+                self._touch_and_save(session)
+                updated.append(self.public_session(session))
+        return updated
+
+    def reconcile_skill_selections(self, valid_skill_ids: set[str]) -> list[Dict[str, Any]]:
+        updated: list[Dict[str, Any]] = []
+        for session in self.sessions.values():
+            selected = session.get("selectedSkillIds", [])
+            filtered = (
+                [item for item in selected if isinstance(item, str) and item in valid_skill_ids]
+                if isinstance(selected, list)
+                else []
+            )
+            if filtered != selected:
+                session["selectedSkillIds"] = filtered
+                session["mafState"] = None
+                session["preRunMafState"] = None
+                session["configFingerprint"] = None
+                session["stateEpoch"] = int(session.get("stateEpoch", 0)) + 1
+                self._touch_and_save(session)
+                updated.append(self.public_session(session))
+        return updated
 
     def reconcile_model_selections(self, settings: FoundrySettings) -> list[Dict[str, Any]]:
         updated: list[Dict[str, Any]] = []

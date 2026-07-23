@@ -66,6 +66,18 @@ export interface ChatSession {
   autoApproveAll?: boolean;
   stateEpoch?: number;
   selectedModel?: ModelSelection | null;
+  selectedSkillIds?: string[];
+}
+
+export interface AgentSkill {
+  id: string;
+  name: string;
+  description: string;
+  contentHash: string;
+  resourceCount: number;
+  resourceBytes: number;
+  scriptsIgnored: boolean;
+  sourceFilename: string;
 }
 
 export interface ResponsesOptions {

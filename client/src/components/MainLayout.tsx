@@ -12,10 +12,12 @@ import {
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import SettingsIcon from '@mui/icons-material/Settings';
+import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
 
 import { useSocket } from '../contexts/SocketContext';
 import {
   ChatSession,
+  AgentSkill,
   FoundrySettings,
   FoundrySettingsWrite,
   MCPServerConfig,
@@ -25,6 +27,7 @@ import ChatInterface from './ChatInterface';
 import FoundryConfigDialog from './FoundryConfigDialog';
 import MCPServerManager from './MCPServerManager';
 import SessionList from './SessionList';
+import SkillsManager from './SkillsManager';
 
 const DRAWER_WIDTH = 300;
 const backendUrl = window.location.origin;
@@ -35,10 +38,12 @@ const MainLayout: React.FC = () => {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [mcpServers, setMcpServers] = useState<MCPServerConfig[]>([]);
   const [availableTools, setAvailableTools] = useState<MCPTool[]>([]);
+  const [skills, setSkills] = useState<AgentSkill[]>([]);
   const [foundrySettings, setFoundrySettings] = useState<FoundrySettings | null>(null);
   const [settingsConfigured, setSettingsConfigured] = useState<boolean | null>(null);
   const [showMCPManager, setShowMCPManager] = useState(false);
   const [showFoundrySettings, setShowFoundrySettings] = useState(false);
+  const [showSkillsManager, setShowSkillsManager] = useState(false);
   const [error, setError] = useState('');
 
   const loadFoundrySettings = async () => {
@@ -61,10 +66,22 @@ const MainLayout: React.FC = () => {
     }
   };
 
+  const loadSkills = async () => {
+    try {
+      const response = await fetch(`${backendUrl}/skills`);
+      if (!response.ok) throw new Error('Unable to read Agent Skills.');
+      const payload = await response.json();
+      setSkills(Array.isArray(payload.skills) ? payload.skills : []);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Failed to load Agent Skills.');
+    }
+  };
+
   useEffect(() => {
     // Remove the legacy browser copy, which could contain an API key.
     localStorage.removeItem('azureConfig');
     loadFoundrySettings();
+    loadSkills();
   }, []);
 
   useEffect(() => {
@@ -86,6 +103,7 @@ const MainLayout: React.FC = () => {
 
     const refresh = () => {
       loadFoundrySettings();
+      loadSkills();
       socket.emit('getSessions');
       socket.emit('getMCPServers');
     };
@@ -112,6 +130,9 @@ const MainLayout: React.FC = () => {
     socket.on('foundrySettingsUpdated', (settings: FoundrySettings) => {
       setFoundrySettings(settings);
       setSettingsConfigured(true);
+    });
+    socket.on('skillsUpdated', (payload: { skills: AgentSkill[] }) => {
+      setSkills(Array.isArray(payload.skills) ? payload.skills : []);
     });
 
     socket.on('mcpServers', (servers: MCPServerConfig[]) => {
@@ -150,6 +171,7 @@ const MainLayout: React.FC = () => {
       socket.off('chat:cancelled', terminalEvent);
       socket.off('chat:error', terminalEvent);
       socket.off('foundrySettingsUpdated');
+      socket.off('skillsUpdated');
       socket.off('mcpServers');
       socket.off('mcpServerRegistered');
       socket.off('mcpServerTools');
@@ -196,6 +218,14 @@ const MainLayout: React.FC = () => {
           </Button>
           <Button
             color="inherit"
+            startIcon={<AutoAwesomeIcon />}
+            onClick={() => setShowSkillsManager(true)}
+            sx={{ mr: 2 }}
+          >
+            Skills ({skills.length})
+          </Button>
+          <Button
+            color="inherit"
             startIcon={<AddIcon />}
             onClick={() => socket?.emit('createNewSession')}
             disabled={!isConnected}
@@ -233,6 +263,7 @@ const MainLayout: React.FC = () => {
           <ChatInterface
             session={currentSession}
             availableTools={availableTools}
+            availableSkills={skills}
             settingsConfigured={configured}
             settings={foundrySettings}
             socket={socket}
@@ -269,6 +300,13 @@ const MainLayout: React.FC = () => {
           onClose={() => setShowMCPManager(false)}
           servers={mcpServers}
           socket={socket}
+        />
+        <SkillsManager
+          open={showSkillsManager}
+          onClose={() => setShowSkillsManager(false)}
+          skills={skills}
+          onChanged={setSkills}
+          onError={setError}
         />
         <Snackbar open={!!error} autoHideDuration={6000} onClose={() => setError('')}>
           <Alert onClose={() => setError('')} severity="error" sx={{ width: '100%' }}>{error}</Alert>

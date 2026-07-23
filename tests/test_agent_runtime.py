@@ -22,6 +22,7 @@ from app.foundry_config import FoundrySettings
 from app.mcp_manager import MCPManager
 from app.provider_factory import ProviderBundle, RouteDescriptor
 from app.session_manager import SessionManager
+from app.skills_manager import SkillsManager
 
 
 def settings(
@@ -221,6 +222,53 @@ async def test_attachment_only_runtime_uses_visible_default_prompt(tmp_path: Pat
 
     assert client.calls[0][0][0].text.endswith("Please analyze the attached file(s).")
     assert sessions.get("chat")["messages"][0]["content"] == "Please analyze the attached file(s)."
+
+
+@pytest.mark.asyncio
+async def test_runtime_uses_selected_maf_skill_provider_and_rebuilds_on_change(tmp_path: Path):
+    sessions = SessionManager(tmp_path / "sessions")
+    sessions.create("chat")
+    skills = SkillsManager(tmp_path / "skills")
+    await skills.upload(
+        "SKILL.md",
+        b"---\nname: writing-guide\ndescription: Use for writing tests.\n---\n# Guide\nBe concise.\n",
+    )
+    client = FakeStreamingClient(["answer"])
+    runtime = AgentRuntime(
+        sessions,
+        MCPManager([]),
+        provider_factory=FakeProviderFactory(client),
+        skills_manager=skills,
+    )
+    first_events: list[tuple[str, dict[str, Any]]] = []
+
+    await runtime.run(
+        session_id="chat",
+        message="write",
+        selected_skill_ids=["writing-guide"],
+        selected_tool_ids=[],
+        settings=settings(),
+        emit=lambda event, payload: _capture(first_events, event, payload),
+    )
+
+    first_options = client.calls[0][1]
+    assert "writing-guide" in first_options["instructions"]
+    assert {tool.name for tool in first_options["tools"]} >= {"load_skill", "read_skill_resource"}
+    assert sessions.selected_skill_ids("chat") == ["writing-guide"]
+
+    second_events: list[tuple[str, dict[str, Any]]] = []
+    await runtime.run(
+        session_id="chat",
+        message="plain",
+        selected_skill_ids=[],
+        selected_tool_ids=[],
+        settings=settings(),
+        emit=lambda event, payload: _capture(second_events, event, payload),
+    )
+
+    assert second_events[0][1]["stateReset"] is True
+    assert "writing-guide" not in client.calls[1][1]["instructions"]
+    assert sessions.selected_skill_ids("chat") == []
 
 
 @pytest.mark.asyncio

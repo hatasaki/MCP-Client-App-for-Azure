@@ -136,6 +136,16 @@ def test_secret_protection_dependencies_and_container_contract_are_explicit():
     assert "unexpectedly loaded with a different key" in workflow
 
 
+def test_latest_maf_skills_compatibility_set_is_pinned():
+    requirements = read("requirements.txt")
+
+    assert "agent-framework-core==1.12.0" in requirements
+    assert "agent-framework-openai==1.10.2" in requirements
+    assert "agent-framework-foundry==1.10.2" in requirements
+    assert "agent-framework-anthropic==1.0.0b260721" in requirements
+    assert "from agent_framework import FileSkillsSource, SkillsProvider" in read("app/skills_manager.py")
+
+
 def test_release_uses_version_source_once_and_publishes_checksums():
     release = read(".github/workflows/build-release.yml")
     container = read(".github/workflows/container-release.yml")

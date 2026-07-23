@@ -19,6 +19,7 @@ A desktop and container-ready Model Context Protocol (MCP) client for Microsoft 
 - **Typed provider parameters** where empty means omit and explicit `false`, `0`, and `none` remain distinct.
 - **Multiple model deployments per endpoint**, with API-specific profiles and a persistent model choice for each chat.
 - **PDF, UTF-8 text, JPEG, and PNG attachments** with API-aware native/fallback handling, content-addressed persistence, and replay after an agent-state rebuild.
+- **Microsoft Agent Framework Agent Skills** uploaded as `SKILL.md` or ZIP bundles, managed in an app-level library and enabled per chat.
 - **GitHub Flavored Markdown, Mermaid, and sanitized static HTML rendering** for assistant output; generated JavaScript is never executed.
 - **AES-256-GCM API-key encryption** backed by Windows Credential Manager, macOS Keychain, or an injected container secret.
 - **Atomic settings/session persistence** and one-time encrypted legacy settings migration.
@@ -35,7 +36,7 @@ A desktop and container-ready Model Context Protocol (MCP) client for Microsoft 
 
 Project endpoints must end in `/api/projects/{project-name}`. MAF `FoundryChatClient` authenticates this route with Entra ID. To use a resource API key, select **Model endpoint**; model endpoints do not expose Project-scoped connections or other Project capabilities.
 
-Claude support uses the beta MAF Anthropic connector. Its `max_tokens` setting is required.
+The current compatibility set uses `agent-framework-core` 1.12.0, the OpenAI and Foundry connectors 1.10.2, and the beta Anthropic connector `1.0.0b260721`. Claude's `max_tokens` setting is required.
 
 ## Desktop installation
 
@@ -161,9 +162,10 @@ Remote authorization follows the MCP OAuth flow. The app opens the authorization
 2. Use the model selector below the input field to choose a configured deployment. Labels include the API type so identical deployment names remain distinguishable. Hover over the information icon for state-rebuild details.
 3. Select the **+** button on the left side of the active chat's message box to attach PDF, UTF-8 TXT, JPEG/JPG, or PNG files.
 4. Select individual MCP tools or all tools from one server.
-5. Send a message and review streamed output. Assistant responses render GitHub Flavored Markdown, Mermaid code fences, and sanitized static HTML.
-6. For each approval batch, approve selected calls, deny all calls, or enable **Always allow all** for that chat session.
-7. Select Stop to cancel the real in-flight task. Partial text is retained with `cancelled` status but is not replayed as completed history.
+5. Select Agent Skills for the current chat when applicable.
+6. Send a message and review streamed output. Assistant responses render GitHub Flavored Markdown, Mermaid code fences, and sanitized static HTML.
+7. For each approval batch, approve selected calls, deny all calls, or enable **Always allow all** for that chat session.
+8. Select Stop to cancel the real in-flight task. Partial text is retained with `cancelled` status but is not replayed as completed history.
 
 The **+** button is shown only after a chat is created or selected. It is disabled while a run is active, before Foundry settings are configured, or after 10 files are selected. Selected files appear as removable chips above the input. A text prompt is optional when files are attached; an attachment-only turn uses `Please analyze the attached file(s).` as its visible prompt.
 
@@ -191,6 +193,29 @@ PDF text fallback is intended for text PDFs. It reads at most 200 pages and shar
 
 Attachment binaries are saved outside session JSON using their SHA-256 content hash. Session messages contain only attachment metadata (`id`, `filename`, `mediaType`, `sizeBytes`, and `contentHash`). Stored bytes are integrity-checked before replay. Deleting a chat deletes its attachment directory; failed or cancelled turns otherwise retain their selected files with the chat.
 
+### Agent Skills
+
+Agent Skills follow the latest Microsoft Agent Framework Python `SkillsProvider` API and the [Agent Skills specification](https://agentskills.io/). The implementation uses progressive disclosure:
+
+1. Selected skill names and descriptions are advertised to the model.
+2. MAF exposes `load_skill` to load the full `SKILL.md` only when needed.
+3. MAF exposes `read_skill_resource` for on-demand reference and asset reads.
+
+Use the top-level **Skills** button to manage the persistent library:
+
+- Upload an individual Markdown skill definition or a ZIP up to 10 MB.
+- A single upload can contain up to 50 skills, the library up to 100 skills, and each chat can enable up to 20 skills.
+- A ZIP can contain a root `SKILL.md`, one `skill-name/SKILL.md`, an optional wrapper directory, or multiple skill directories.
+- Each skill must have valid YAML frontmatter with a lowercase hyphenated `name` and a `description`. The directory name must match `name` after upload normalization.
+- Valid resources are UTF-8 `.md`, `.json`, `.yaml`, `.yml`, `.csv`, `.xml`, and `.txt` files under `references/` or `assets/`, up to one subdirectory level.
+- Optional `LICENSE`, `LICENSE.md`, or `LICENSE.txt` files are retained at the skill root but are not exposed as model resources.
+- Uploading an existing skill name replaces that library entry. Removing a skill also removes it from every chat that selected it.
+- In each chat, use **Select skills** to persist the enabled skill set. Changing that set changes the agent-state fingerprint, so the next run rebuilds MAF state and replays completed history under the new skill context.
+
+Uploaded skills are treated as untrusted instructions. ZIP extraction rejects path traversal, absolute paths, duplicate case-insensitive paths, encrypted entries, symlinks and other special files, excessive entry counts, and oversized compressed/expanded content. Persisted skill files are content-hashed and checked when the library is loaded.
+
+This release deliberately supports **instructions and text resources only**. Files under `scripts/` are removed during upload, shown as **Scripts removed** in the Skills dialog, and never registered with a script runner. Consequently uploaded skill code cannot execute. Read-only `load_skill` and `read_skill_resource` operations are registered through MAF without an approval prompt; MCP tools retain the existing approval behavior.
+
 ### Markdown, Mermaid, and HTML rendering
 
 - GitHub Flavored Markdown supports headings, lists, tables, block quotes, links, inline code, and fenced code blocks.
@@ -215,7 +240,7 @@ Tool IDs are qualified as `{server-id}:{remote-tool-name}`, preventing collision
 #weather-server:get_forecast What is the forecast for Seattle?
 ```
 
-The selected model is persisted per chat. Changing it is blocked during an active run. On the next message, provider-specific MAF state is rebuilt and completed user turns (including persisted attachments) plus completed assistant text are replayed under that model's complete API profile. The same replay behavior applies when Foundry settings change; cancelled, interrupted, streaming, and error assistant messages are excluded.
+The selected model and selected Agent Skills are persisted per chat. Changing either is blocked during an active run. On the next message, provider-specific MAF state is rebuilt and completed user turns (including persisted attachments) plus completed assistant text are replayed under that model and skill context. The same replay behavior applies when Foundry settings change; cancelled, interrupted, streaming, and error assistant messages are excluded.
 
 ## Data and security
 
@@ -228,14 +253,16 @@ The data directory contains:
 
 - `FoundrySettings.json` — endpoint, API-specific model profiles, parameters, and an AES-GCM encrypted API-key envelope when configured.
 - `mcp.json` — saved MCP definitions, including configured headers/environment values.
-- `sessions/*.json` — schema-v4 visible messages, attachment metadata, selected model, and opaque MAF session state.
+- `sessions/*.json` — schema-v5 visible messages, attachment metadata, selected model/skills, and opaque MAF session state.
 - `sessions/attachments/<session-hash>/<sha256>` — content-addressed attachment binaries retained until the chat is deleted.
+- `skills/skills.json` — Agent Skills library metadata.
+- `skills/library/<skill-name>/` — normalized `SKILL.md` and allowed text resources.
 
-Older session files are migrated to schema v4 when loaded. Existing messages receive an empty `attachments` array; no binary data is invented or deleted during migration.
+Older session files are migrated to schema v5 when loaded. Existing messages receive an empty `attachments` array and existing chats receive an empty `selectedSkillIds` list; no binary data is invented or deleted during migration.
 
 Desktop builds store the 256-bit encryption master key separately: Windows Credential Manager on Windows and login Keychain on macOS. `FoundrySettings.json` contains only `version`, `algorithm`, `keyId`, `nonce`, and authenticated ciphertext. Losing the OS credential prevents decryption; the status API exposes only validated non-secret profiles so the settings dialog can retain them while requiring a replacement API key. There is no plaintext fallback.
 
-Attachment writes and session JSON writes use temporary files followed by atomic replacement. Attachment bytes are not duplicated in session JSON, but they are also not encrypted by the application. The other files can still contain MCP headers, environment variables, opaque provider state, chat content, or uploaded files. Protect the directory with operating-system permissions and do not commit or share it. The browser receives only redacted Foundry settings.
+Attachment writes, Skills manifest writes, and session JSON writes use temporary files followed by atomic replacement. Attachment bytes are not duplicated in session JSON. Attachments and Agent Skills are not encrypted by the application. The other files can still contain MCP headers, environment variables, opaque provider state, chat content, uploaded files, or uploaded instructions. Protect the directory with operating-system permissions and do not commit or share it. The browser receives only redacted Foundry settings.
 
 Optional keys in `mcpclient.conf`:
 
@@ -295,7 +322,7 @@ npm audit --omit=dev --audit-level=high
 npm run build
 ```
 
-Provider wire tests use mock HTTP transports and verify exact URLs, authentication headers, typed request bodies, explicit omit semantics, native Responses PDF/image input, Chat Completions image URLs, and Claude base64 image blocks. Attachment tests also cover limits, file signatures, content-addressed persistence, integrity checks, fallback extraction, replay, and deletion.
+Provider wire tests use mock HTTP transports and verify exact URLs, authentication headers, typed request bodies, explicit omit semantics, native Responses PDF/image input, Chat Completions image URLs, and Claude base64 image blocks. Attachment tests also cover limits, file signatures, content-addressed persistence, integrity checks, fallback extraction, replay, and deletion. Agent Skills tests cover standalone and bundled uploads, MAF discovery/context injection, script removal, ZIP traversal/special-file defenses, resource restrictions, replacement/deletion, per-chat persistence, and state rebuilds.
 
 Use `requirements-test.txt` for headless backend tests, `requirements-dev.txt` for desktop tests, and `requirements-build.txt` for the complete desktop packaging toolchain.
 

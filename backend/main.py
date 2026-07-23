@@ -8,6 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import socketio
 from fastapi import FastAPI, HTTPException, Request
@@ -28,6 +29,7 @@ from app.attachments import (
     parse_incoming_attachments,
 )
 from app.config import (
+    SKILLS_PATH,
     foundry_settings_store,
     load_foundry_settings,
     update_foundry_settings,
@@ -37,6 +39,7 @@ from app.mcp_manager import MCPManager, register_callback_result
 from app.saved_servers_manager import SavedServersManager
 from app.session_manager import SessionManager
 from app.secret_protection import SecretProtectionError
+from app.skills_manager import MAX_SKILL_UPLOAD_BYTES, SkillLibraryError, SkillsManager
 
 logger = logging.getLogger("mcpclient.backend")
 
@@ -44,6 +47,7 @@ session_manager = SessionManager()
 saved_servers_manager = SavedServersManager()
 mcp_manager: MCPManager | None = None
 agent_runtime: AgentRuntime | None = None
+skills_manager: SkillsManager | None = None
 foundry_settings: FoundrySettings | None = None
 foundry_settings_error: str | None = None
 recoverable_foundry_settings: FoundrySettings | None = None
@@ -56,7 +60,7 @@ settings_operation_lock = asyncio.Lock()
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
-    global mcp_manager, agent_runtime, foundry_settings, foundry_settings_error, recoverable_foundry_settings
+    global mcp_manager, agent_runtime, skills_manager, foundry_settings, foundry_settings_error, recoverable_foundry_settings
     try:
         foundry_settings = load_foundry_settings()
         foundry_settings_error = None
@@ -74,8 +78,11 @@ async def app_lifespan(_app: FastAPI):
         logger.error("Microsoft Foundry settings could not be loaded: %s", exc)
     if foundry_settings:
         session_manager.reconcile_model_selections(foundry_settings)
+    skills_manager = SkillsManager(SKILLS_PATH)
+    await skills_manager.validate_library()
+    session_manager.reconcile_skill_selections(skills_manager.ids())
     mcp_manager = await MCPManager([]).__aenter__()
-    agent_runtime = AgentRuntime(session_manager, mcp_manager)
+    agent_runtime = AgentRuntime(session_manager, mcp_manager, skills_manager=skills_manager)
     try:
         yield
     finally:
@@ -273,6 +280,63 @@ async def set_foundry_settings(payload: FoundrySettingsWrite) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+@fastapi_app.get("/skills")
+async def get_skills() -> dict[str, Any]:
+    return {"skills": skills_manager.list() if skills_manager else []}
+
+
+async def _read_limited_body(request: Request, limit: int) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > limit:
+            raise HTTPException(status_code=413, detail="The skill upload exceeds the 10 MB limit.")
+    return bytes(body)
+
+
+@fastapi_app.post("/skills/upload")
+async def upload_skills(request: Request) -> dict[str, Any]:
+    if skills_manager is None:
+        raise HTTPException(status_code=503, detail="Skills manager is not available.")
+    filename = unquote(request.headers.get("x-skill-filename", "").strip())
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_SKILL_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="The skill upload exceeds the 10 MB limit.")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header.") from exc
+    body = await _read_limited_body(request, MAX_SKILL_UPLOAD_BYTES)
+    try:
+        async with settings_operation_lock:
+            if agent_runtime and agent_runtime.has_active_runs():
+                raise HTTPException(status_code=409, detail="Skills cannot be changed while a chat run is active.")
+            uploaded = await skills_manager.upload(filename, body)
+    except SkillLibraryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await sio.emit("skillsUpdated", {"skills": skills_manager.list()})
+    return {"uploaded": uploaded, "skills": skills_manager.list()}
+
+
+@fastapi_app.delete("/skills/{skill_id}")
+async def delete_skill(skill_id: str) -> dict[str, Any]:
+    if skills_manager is None:
+        raise HTTPException(status_code=503, detail="Skills manager is not available.")
+    try:
+        async with settings_operation_lock:
+            if agent_runtime and agent_runtime.has_active_runs():
+                raise HTTPException(status_code=409, detail="Skills cannot be changed while a chat run is active.")
+            await skills_manager.delete(skill_id)
+            reconciled = session_manager.remove_skill_from_sessions(skill_id)
+    except SkillLibraryError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    payload = {"skills": skills_manager.list()}
+    await sio.emit("skillsUpdated", payload)
+    for session in reconciled:
+        await sio.emit("sessionUpdated", session)
+    return payload
+
+
 @sio.event
 async def createNewSession(sid: str) -> None:
     default_selection = foundry_settings.default_selection if foundry_settings else None
@@ -357,11 +421,19 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
         return
     selected_tool_ids = data.get("selectedToolIds", [])
     selected_model = data.get("selectedModel")
+    selected_skill_ids_value = data.get("selectedSkillIds")
     if (
         not isinstance(message, str)
         or (not message.strip() and not attachments)
         or not isinstance(selected_tool_ids, list)
         or any(not isinstance(item, str) for item in selected_tool_ids)
+        or (
+            selected_skill_ids_value is not None
+            and (
+                not isinstance(selected_skill_ids_value, list)
+                or any(not isinstance(item, str) for item in selected_skill_ids_value)
+            )
+        )
         or (selected_model is not None and not isinstance(selected_model, dict))
     ):
         await sio.emit(
@@ -372,7 +444,7 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
                 code="InvalidRequest",
                 message=(
                     "message must be a string and either message or attachments must be non-empty; "
-                    "selectedToolIds must be an array, "
+                    "selectedToolIds and selectedSkillIds must be arrays, "
                     "and selectedModel must be an object when provided."
                 ),
             ),
@@ -383,6 +455,7 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
     created_session: dict[str, Any] | None = None
     ownership_registered = False
     disconnected = False
+    selected_skill_ids: list[str] = []
 
     async def unregister_socket_run() -> None:
         nonlocal ownership_registered
@@ -406,20 +479,34 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
             existing_session = session_manager.get_session(session_id) if session_id else None
             if existing_session is not None:
                 reservation = await agent_runtime.reserve_run(session_id, request_id)
+                selected_skill_ids = (
+                    list(selected_skill_ids_value)
+                    if isinstance(selected_skill_ids_value, list)
+                    else list(existing_session.get("selectedSkillIds", []))
+                )
                 selection_value = selected_model if selected_model is not None else (
                     existing_session.get("selectedModel") or active_settings.default_selection
                 )
                 try:
                     selection = ModelSelection.model_validate(selection_value)
                     runtime_settings = active_settings.resolve(selection)
+                    if skills_manager:
+                        skills_manager.fingerprint(selected_skill_ids)
+                    elif selected_skill_ids:
+                        raise ValueError("Agent Skills are not available.")
                 except (ValidationError, ValueError, KeyError):
                     await agent_runtime.release_run(reservation)
                     reservation = None
                     raise
             else:
+                selected_skill_ids = list(selected_skill_ids_value) if isinstance(selected_skill_ids_value, list) else []
                 selection_value = selected_model if selected_model is not None else active_settings.default_selection
                 selection = ModelSelection.model_validate(selection_value)
                 runtime_settings = active_settings.resolve(selection)
+                if skills_manager:
+                    skills_manager.fingerprint(selected_skill_ids)
+                elif selected_skill_ids:
+                    raise ValueError("Agent Skills are not available.")
                 session_id = str(uuid.uuid4())
                 reservation = await agent_runtime.reserve_run(session_id, request_id)
             async with socket_registry_lock:
@@ -433,6 +520,8 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
                 reservation = None
             elif existing_session is None:
                 created_session = session_manager.create(session_id, selection)
+                if selected_skill_ids:
+                    created_session = session_manager.set_selected_skills(session_id, selected_skill_ids)
     except AgentRunBusyError as exc:
         current = session_manager.get_public_session(session_id)
         await sio.emit(
@@ -443,6 +532,18 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
                 code="RunBusy",
                 message=str(exc),
                 session=current,
+            ),
+            room=sid,
+        )
+        return
+    except SkillLibraryError as exc:
+        await sio.emit(
+            "chat:error",
+            _chat_error_payload(
+                request_id=request_id,
+                session_id=session_id,
+                code="InvalidSkillSelection",
+                message=str(exc),
             ),
             room=sid,
         )
@@ -490,6 +591,7 @@ async def chat_send(sid: str, data: dict[str, Any]) -> None:
             session_id=session_id,
             message=message,
             attachments=attachments,
+            selected_skill_ids=selected_skill_ids,
             selected_tool_ids=selected_tool_ids,
             settings=runtime_settings,
             emit=emit,
@@ -579,6 +681,37 @@ async def setSessionModel(sid: str, data: dict[str, Any]) -> None:
         )
     except AgentRunBusyError:
         await sio.emit("error", {"message": "The model cannot be changed while a run is active."}, room=sid)
+        current = session_manager.get_public_session(session_id)
+        if current:
+            await sio.emit("sessionUpdated", current, room=sid)
+        return
+    await sio.emit("sessionUpdated", updated)
+
+
+@sio.event
+async def setSessionSkills(sid: str, data: dict[str, Any]) -> None:
+    data = data if isinstance(data, dict) else {}
+    session_id = str(data.get("sessionId") or "")
+    skill_ids = data.get("selectedSkillIds", [])
+    if session_manager.get_session(session_id) is None:
+        await sio.emit("error", {"message": "Session not found."}, room=sid)
+        return
+    if not isinstance(skill_ids, list) or any(not isinstance(item, str) for item in skill_ids):
+        await sio.emit("error", {"message": "selectedSkillIds must be an array of strings."}, room=sid)
+        return
+    try:
+        async with settings_operation_lock:
+            if skills_manager:
+                skills_manager.fingerprint(skill_ids)
+            elif skill_ids:
+                raise SkillLibraryError("Agent Skills are not available.")
+            updated = (
+                await agent_runtime.set_selected_skills(session_id, skill_ids)
+                if agent_runtime
+                else session_manager.set_selected_skills(session_id, skill_ids)
+            )
+    except (AgentRunBusyError, SkillLibraryError, ValueError) as exc:
+        await sio.emit("error", {"message": str(exc)}, room=sid)
         current = session_manager.get_public_session(session_id)
         if current:
             await sio.emit("sessionUpdated", current, room=sid)

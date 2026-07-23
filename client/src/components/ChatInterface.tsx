@@ -23,6 +23,7 @@ import {
   Typography,
 } from '@mui/material';
 import BuildIcon from '@mui/icons-material/Build';
+import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
@@ -37,6 +38,7 @@ import { Socket } from 'socket.io-client';
 import MarkdownRenderer from './MarkdownRenderer';
 import {
   ChatApprovalRequiredEvent,
+  AgentSkill,
   ChatDeltaEvent,
   ChatMessage,
   ChatSession,
@@ -54,6 +56,7 @@ import {
 interface ChatInterfaceProps {
   session: ChatSession;
   availableTools: MCPTool[];
+  availableSkills: AgentSkill[];
   settingsConfigured: boolean;
   settings: FoundrySettings;
   socket: Socket | null;
@@ -73,6 +76,7 @@ const API_LABELS: Record<ModelSelection['apiType'], string> = {
 const MAX_ATTACHMENT_COUNT = 10;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_SELECTED_SKILLS = 20;
 const SUPPORTED_MEDIA_TYPES = new Set<AttachmentMediaType>([
   'application/pdf',
   'text/plain',
@@ -92,6 +96,7 @@ const makeRequestId = () =>
 const ChatInterface: React.FC<ChatInterfaceProps> = ({
   session,
   availableTools,
+  availableSkills,
   settingsConfigured,
   settings,
   socket,
@@ -100,6 +105,8 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const [attachments, setAttachments] = useState<ChatAttachmentUpload[]>([]);
   const [selectedTools, setSelectedTools] = useState<SelectedTool[]>([]);
   const [showToolSelector, setShowToolSelector] = useState(false);
+  const [showSkillSelector, setShowSkillSelector] = useState(false);
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>(() => session.selectedSkillIds || []);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [liveMessage, setLiveMessage] = useState<LiveMessage | null>(null);
@@ -230,6 +237,12 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
   }, [session.id]);
 
   useEffect(() => {
+    setSelectedSkillIds((session.selectedSkillIds || []).filter((id) =>
+      availableSkills.some((skill) => skill.id === id)
+    ));
+  }, [session.selectedSkillIds, availableSkills]);
+
+  useEffect(() => {
     setSelectedModel(validSelection(session.selectedModel) ? session.selectedModel! : settings.defaultSelection);
   }, [session.id, session.selectedModel, settings.defaultSelection, validSelection]);
 
@@ -262,6 +275,7 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       sessionId: session.id,
       message: message.trim(),
       attachments,
+      selectedSkillIds,
       selectedToolIds: selectedTools.map((tool) => tool.id),
       selectedModel,
     });
@@ -380,6 +394,16 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
           disabled={!settingsConfigured}
         >
           Select tools ({selectedTools.length}/{availableTools.length})
+        </Button>
+        <Button
+          variant="outlined"
+          startIcon={<AutoAwesomeIcon />}
+          onClick={() => setShowSkillSelector(true)}
+          size="small"
+          sx={{ mt: 1, ml: 1 }}
+          disabled={!settingsConfigured || isLoading}
+        >
+          Select skills ({selectedSkillIds.length}/{availableSkills.length})
         </Button>
         {session.autoApproveAll && <Alert severity="warning" sx={{ mt: 1 }}>This session automatically approves tool calls.</Alert>}
         {!availableTools.length && <Alert severity="info" sx={{ mt: 1 }}>No MCP tools are currently available.</Alert>}
@@ -579,6 +603,44 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
           {!availableTools.length && <Typography>No tools available.</Typography>}
         </DialogContent>
         <DialogActions><Button onClick={() => setShowToolSelector(false)}>Close</Button></DialogActions>
+      </Dialog>
+
+      <Dialog open={showSkillSelector} onClose={() => setShowSkillSelector(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Select Agent Skills for this chat</DialogTitle>
+        <DialogContent>
+          <Typography color="text.secondary" sx={{ mb: 1 }}>
+            Selected skills are advertised to the model and loaded on demand through Microsoft Agent Framework.
+            Up to {MAX_SELECTED_SKILLS} skills can be enabled per chat.
+          </Typography>
+          <FormGroup>
+            {availableSkills.map((skill) => (
+              <FormControlLabel
+                key={skill.id}
+                control={
+                  <Checkbox
+                    checked={selectedSkillIds.includes(skill.id)}
+                    disabled={!selectedSkillIds.includes(skill.id) && selectedSkillIds.length >= MAX_SELECTED_SKILLS}
+                    onChange={(event) => {
+                      const next = event.target.checked
+                        ? [...selectedSkillIds, skill.id]
+                        : selectedSkillIds.filter((id) => id !== skill.id);
+                      setSelectedSkillIds(next);
+                      socket?.emit('setSessionSkills', { sessionId: session.id, selectedSkillIds: next });
+                    }}
+                  />
+                }
+                label={
+                  <Box>
+                    <Typography>{skill.name}</Typography>
+                    <Typography variant="body2" color="text.secondary">{skill.description}</Typography>
+                  </Box>
+                }
+              />
+            ))}
+          </FormGroup>
+          {!availableSkills.length && <Typography>No Agent Skills are installed. Use the top-level Skills button.</Typography>}
+        </DialogContent>
+        <DialogActions><Button onClick={() => setShowSkillSelector(false)}>Close</Button></DialogActions>
       </Dialog>
 
       <Dialog open={!!approvalBatch} onClose={() => undefined} maxWidth="sm" fullWidth>
