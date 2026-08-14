@@ -1,18 +1,18 @@
-fastapi==0.139.2
-uvicorn[standard]==0.51.0
-python-socketio[asyncio]==5.16.3
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+python-socketio[asyncio]==5.16.4
 httpx==0.28.1
 pydantic==2.13.4
 azure-identity==1.25.3
-cryptography==49.0.0
-pypdf==6.14.2
+cryptography==50.0.0
+pypdf==6.15.0
 
 # Microsoft Agent Framework 1.x compatibility set (Python 3.10+)
-agent-framework-core==1.12.0
-agent-framework-openai==1.10.2
-agent-framework-foundry==1.10.2
-agent-framework-anthropic==1.0.0b260721
-openai==2.46.0
+agent-framework-core==1.13.0
+agent-framework-openai==1.12.0
+agent-framework-foundry==1.10.4
+agent-framework-anthropic==1.0.0b260730
+openai==2.54.0
 # agent-framework-anthropic 1.0.0b260721 requires anthropic <0.117.0.
-anthropic==0.116.0
-mcp==1.28.1
+anthropic==0.121.0
+mcp==2.0.0
